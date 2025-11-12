@@ -26,11 +26,13 @@ UNIT_FIRST_RE = re.compile(
 )
 
 def to_float_br(s: str) -> float:
+    """Converte '12.345,67' -> 12345.67"""
     return float(s.replace('.', '').replace(',', '.'))
 
 def parse_item_bloco(bloco: str):
     """
-    Extrai: Código, Descrição, NCM, CFOP, UN, QTD, V.Unit, V.Total
+    Extrai: Código, Descrição, NCM, CFOP, UN, QTD (string),
+            V.Unit (float), V.Total (float)
     a partir de um bloco de texto (uma ou mais linhas do item).
     """
     # 1) Código + Descrição (até NCM) + NCM + CFOP
@@ -53,7 +55,7 @@ def parse_item_bloco(bloco: str):
     descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
     # 2) QTD e UN: aceita "QTD UN", "UN QTD" e casos sem espaço entre CFOP e UN
-    qtd_str = None
+    qtd_str = None   # <-- manteremos como STRING no DataFrame final
     un = None
 
     m_q = UNIT_QTD_RE.search(resto)
@@ -75,34 +77,39 @@ def parse_item_bloco(bloco: str):
                 if m_num_prev:
                     qtd_str = m_num_prev[-1].group(0)
 
-    qtd = to_float_br(qtd_str) if qtd_str else None
-
     # 3) V.Unit e V.Total por consistência (V.Unit * QTD ≈ V.Total)
     v_unit = None
     v_total = None
-    if qtd is not None and qtd > 0:
-        nums = [n.group(0) for n in NUM_RE.finditer(resto)]
-        values = [(to_float_br(s), s) for s in nums]  # preserva duplicados e ordem
-        best = None
-        best_score = (1e9, 0)  # (erro_abs, -total) => prefere menor erro e total maior
-        for i in range(len(values)):
-            a = values[i][0]  # candidato V.Unit
-            if a <= 0:
-                continue
-            for j in range(i + 1, len(values)):
-                b = values[j][0]  # candidato V.Total
-                if b <= 0 or b < a:  # total deve ser >= unit
+    if qtd_str:
+        try:
+            qtd_val = to_float_br(qtd_str)
+        except Exception:
+            qtd_val = None
+
+        if qtd_val is not None and qtd_val > 0:
+            nums = [n.group(0) for n in NUM_RE.finditer(resto)]
+            # Mantém duplicados e ordem; converte para float para testar consistência
+            values = [(to_float_br(s), s) for s in nums]
+            best = None
+            best_score = (1e9, 0)  # (erro_abs, -total) => prefere menor erro e total maior
+            for i in range(len(values)):
+                a = values[i][0]  # candidato V.Unit
+                if a <= 0:
                     continue
-                err = abs(a * qtd - b)
-                tol = max(0.001 * max(1.0, b), 0.05)  # tolerância
-                if err < tol:
-                    score = (err, -b)
-                    if score < best_score:
-                        best_score = score
-                        best = (values[i][1], values[j][1])  # strings originais
-        if best:
-            v_unit = to_float_br(best[0])
-            v_total = to_float_br(best[1])
+                for j in range(i + 1, len(values)):
+                    b = values[j][0]  # candidato V.Total
+                    if b <= 0 or b < a:  # total deve ser >= unit
+                        continue
+                    err = abs(a * qtd_val - b)
+                    tol = max(0.001 * max(1.0, b), 0.05)  # tolerância pequena
+                    if err < tol:
+                        score = (err, -b)
+                        if score < best_score:
+                            best_score = score
+                            best = (values[i][1], values[j][1])  # strings originais
+            if best:
+                v_unit = to_float_br(best[0])
+                v_total = to_float_br(best[1])
 
     return {
         "Código": codigo,
@@ -110,7 +117,8 @@ def parse_item_bloco(bloco: str):
         "NCM/SH": ncm,
         "CFOP": cfop,
         "UN": un,
-        "QTD": qtd,
+        # QTD MANTIDA COMO STRING no padrão da NF
+        "QTD": qtd_str,  # <--- aqui fica '1,0000', '205,0000', etc.
         "V. Unitário (R$)": v_unit,
         "V. Total (R$)": v_total
     }
@@ -122,7 +130,8 @@ if pdf_file:
     with pdfplumber.open(pdf_file) as pdf:
         texto_nf = ""
         for pagina in pdf.pages:
-            # x_tolerance/y_tolerance podem ajudar a juntar colunas próximas
+            # x_tolerance/y_tolerance podem ser ajustados via extract_words()
+            # caso precise refinar colunas, mas aqui usamos extract_text()
             texto_nf += (pagina.extract_text() or "") + "\n"
 
     # ------------------------------
@@ -177,8 +186,8 @@ if pdf_file:
             st.dataframe(df_sel, use_container_width=True)
 
             # Exportar Excel
+            # Observação: 'QTD' vai como TEXTO no Excel, preservando vírgulas e casas decimais
             excel_output = io.BytesIO()
-            # (opcional) formatar decimais no Excel
             df_sel.to_excel(excel_output, index=False)
             excel_output.seek(0)
             st.download_button(
