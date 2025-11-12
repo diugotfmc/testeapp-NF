@@ -26,36 +26,44 @@ UNIT_FIRST_RE = re.compile(
 )
 
 def to_float_br(s: str) -> float:
-    """Converte '12.345,67' -> 12345.67"""
     return float(s.replace('.', '').replace(',', '.'))
 
 def parse_item_bloco(bloco: str):
     """
-    Extrai: Código, Descrição, NCM, CFOP, UN, QTD (string),
-            V.Unit (float), V.Total (float)
+    Extrai: Código, IT, NM, Descrição, NCM, CFOP, UN, QTD (string PT-BR),
+            V. Unitário (float), V. Total (float)
     a partir de um bloco de texto (uma ou mais linhas do item).
     """
-    # 1) Código + Descrição (até NCM) + NCM + CFOP
+    # 1) Código + "miolo" + NCM + CFOP
     m = re.search(
-        r'^(?P<codigo>[A-Z0-9]{2,}\d{2,}[A-Z0-9]*)\s+(?P<desc>.+?)\s+(?P<ncm>\d{8})\s+\d{3}\s+(?P<cfop>\d{4})',
+        r'^(?P<codigo>[A-Z0-9]{2,}\d{2,}[A-Z0-9]*)\s+(?P<miolo>.+?)\s+(?P<ncm>\d{8})\s+\d{3}\s+(?P<cfop>\d{4})',
         bloco
     )
     if not m:
         return None
 
     codigo = m.group('codigo').strip()
-    descricao = m.group('desc').strip()
+    miolo = m.group('miolo').strip()  # contém "ITxxx - NMyyyyyy - Descrição"
     ncm = m.group('ncm').strip()
     cfop = m.group('cfop').strip()
     resto = bloco[m.end():]
 
-    # Limpeza da descrição (remove ITxxx e marcadores NMxxxxx)
+    # 2) IT e NM a partir do "miolo"
+    it_match = re.search(r'\b(IT\d+)\b', miolo)
+    nm_match = re.search(r'\b(NM\d+)\b', miolo)
+
+    it_val = it_match.group(1) if it_match else None
+    nm_val = nm_match.group(1) if nm_match else None
+
+    # 3) Descrição: remove ITxxx e NMxxxxxx e hifens excedentes
+    descricao = miolo
     descricao = re.sub(r'\bIT\d+\b', '', descricao)
-    descricao = re.sub(r'-\s*NM\d+\s*-', '-', descricao)
+    descricao = re.sub(r'\bNM\d+\b', '', descricao)
+    descricao = re.sub(r'\s*-\s*', ' - ', descricao)     # normaliza os hifens
     descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
-    # 2) QTD e UN: aceita "QTD UN", "UN QTD" e casos sem espaço entre CFOP e UN
-    qtd_str = None   # <-- manteremos como STRING no DataFrame final
+    # 4) QTD e UN (mantendo QTD no formato string PT-BR)
+    qtd_str = None
     un = None
 
     m_q = UNIT_QTD_RE.search(resto)
@@ -77,48 +85,48 @@ def parse_item_bloco(bloco: str):
                 if m_num_prev:
                     qtd_str = m_num_prev[-1].group(0)
 
-    # 3) V.Unit e V.Total por consistência (V.Unit * QTD ≈ V.Total)
+    # 5) V.Unit e V.Total por consistência (V.Unit * QTD ≈ V.Total)
     v_unit = None
     v_total = None
     if qtd_str:
         try:
             qtd_val = to_float_br(qtd_str)
-        except Exception:
-            qtd_val = None
-
-        if qtd_val is not None and qtd_val > 0:
-            nums = [n.group(0) for n in NUM_RE.finditer(resto)]
-            # Mantém duplicados e ordem; converte para float para testar consistência
-            values = [(to_float_br(s), s) for s in nums]
-            best = None
-            best_score = (1e9, 0)  # (erro_abs, -total) => prefere menor erro e total maior
-            for i in range(len(values)):
-                a = values[i][0]  # candidato V.Unit
-                if a <= 0:
-                    continue
-                for j in range(i + 1, len(values)):
-                    b = values[j][0]  # candidato V.Total
-                    if b <= 0 or b < a:  # total deve ser >= unit
+            if qtd_val > 0:
+                nums = [n.group(0) for n in NUM_RE.finditer(resto)]
+                values = [(to_float_br(s), s) for s in nums]  # (float, texto)
+                best = None
+                best_score = (1e9, 0)  # (erro_abs, -total) => prefere menor erro e total maior
+                for i in range(len(values)):
+                    a = values[i][0]  # candidato V.Unit
+                    if a <= 0:
                         continue
-                    err = abs(a * qtd_val - b)
-                    tol = max(0.001 * max(1.0, b), 0.05)  # tolerância pequena
-                    if err < tol:
-                        score = (err, -b)
-                        if score < best_score:
-                            best_score = score
-                            best = (values[i][1], values[j][1])  # strings originais
-            if best:
-                v_unit = to_float_br(best[0])
-                v_total = to_float_br(best[1])
+                    for j in range(i + 1, len(values)):
+                        b = values[j][0]  # candidato V.Total
+                        if b <= 0 or b < a:
+                            continue
+                        err = abs(a * qtd_val - b)
+                        tol = max(0.001 * max(1.0, b), 0.05)  # tolerância
+                        if err < tol:
+                            score = (err, -b)
+                            if score < best_score:
+                                best_score = score
+                                best = (values[i][1], values[j][1])  # guarda os textos originais
+                if best:
+                    v_unit = to_float_br(best[0])
+                    v_total = to_float_br(best[1])
+        except Exception:
+            pass
 
     return {
         "Código": codigo,
+        "IT": it_val,
+        "NM": nm_val,
         "Descrição": descricao,
         "NCM/SH": ncm,
         "CFOP": cfop,
         "UN": un,
-        # QTD MANTIDA COMO STRING no padrão da NF
-        "QTD": qtd_str,  # <--- aqui fica '1,0000', '205,0000', etc.
+        # >>> mantém QTD como string com vírgula e 4 casas:
+        "QTD": qtd_str,
         "V. Unitário (R$)": v_unit,
         "V. Total (R$)": v_total
     }
@@ -130,8 +138,6 @@ if pdf_file:
     with pdfplumber.open(pdf_file) as pdf:
         texto_nf = ""
         for pagina in pdf.pages:
-            # x_tolerance/y_tolerance podem ser ajustados via extract_words()
-            # caso precise refinar colunas, mas aqui usamos extract_text()
             texto_nf += (pagina.extract_text() or "") + "\n"
 
     # ------------------------------
@@ -170,6 +176,11 @@ if pdf_file:
         st.warning("⚠️ Nenhum item identificado. Pode ser necessário ajustar o padrão de leitura.")
     else:
         df_itens = pd.DataFrame(itens)
+
+        # Ordena colunas para destacar IT/NM
+        cols = ["Código", "IT", "NM", "Descrição", "NCM/SH", "CFOP", "UN", "QTD", "V. Unitário (R$)", "V. Total (R$)"]
+        df_itens = df_itens.reindex(columns=[c for c in cols if c in df_itens.columns])
+
         st.subheader("📋 Itens Identificados na Nota Fiscal")
         st.dataframe(df_itens, use_container_width=True)
 
@@ -185,8 +196,8 @@ if pdf_file:
             st.success(f"{len(df_sel)} item(ns) selecionado(s)!")
             st.dataframe(df_sel, use_container_width=True)
 
-            # Exportar Excel
-            # Observação: 'QTD' vai como TEXTO no Excel, preservando vírgulas e casas decimais
+            # Exportar Excel (mantendo QTD como texto)
+            # Dica: para garantir que o Excel não converta, podemos deixar como texto mesmo.
             excel_output = io.BytesIO()
             df_sel.to_excel(excel_output, index=False)
             excel_output.seek(0)
