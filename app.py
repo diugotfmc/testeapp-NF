@@ -28,11 +28,28 @@ UNIT_FIRST_RE = re.compile(
 def to_float_br(s: str) -> float:
     return float(s.replace('.', '').replace(',', '.'))
 
+def format_nm(nm_text: str) -> str:
+    """
+    Recebe algo como 'NM12773524' e devolve '12.773.524'.
+    Regra: extrai dígitos; se tiver 8 dígitos, aplica máscara 2-3-3.
+    Caso tenha outro tamanho, faz group de milhar padrão.
+    """
+    if not nm_text:
+        return None
+    # extrai dígitos
+    digits = ''.join(re.findall(r'\d', nm_text))
+    if len(digits) == 8:
+        return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
+    # fallback: milhar
+    # inverte, insere pontos a cada 3, volta ao normal
+    rev = digits[::-1]
+    chunks = [rev[i:i+3] for i in range(0, len(rev), 3)]
+    return '.'.join(ch[::-1] for ch in chunks[::-1]) if digits else None
+
 def parse_item_bloco(bloco: str):
     """
-    Extrai: Código, IT, NM, Descrição, NCM, CFOP, UN, QTD (string PT-BR),
+    Extrai: Código, IT, NM(formatado), Descrição, NCM, CFOP, UN, QTD (string PT-BR),
             V. Unitário (float), V. Total (float)
-    a partir de um bloco de texto (uma ou mais linhas do item).
     """
     # 1) Código + "miolo" + NCM + CFOP
     m = re.search(
@@ -53,7 +70,8 @@ def parse_item_bloco(bloco: str):
     nm_match = re.search(r'\b(NM\d+)\b', miolo)
 
     it_val = it_match.group(1) if it_match else None
-    nm_val = nm_match.group(1) if nm_match else None
+    nm_raw = nm_match.group(1) if nm_match else None
+    nm_fmt = format_nm(nm_raw) if nm_raw else None
 
     # 3) Descrição: remove ITxxx e NMxxxxxx e hifens excedentes
     descricao = miolo
@@ -62,7 +80,7 @@ def parse_item_bloco(bloco: str):
     descricao = re.sub(r'\s*-\s*', ' - ', descricao)     # normaliza os hifens
     descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
-    # 4) QTD e UN (mantendo QTD no formato string PT-BR)
+    # 4) QTD e UN (mantendo QTD no formato string PT-BR com vírgula)
     qtd_str = None
     un = None
 
@@ -120,12 +138,13 @@ def parse_item_bloco(bloco: str):
     return {
         "Código": codigo,
         "IT": it_val,
-        "NM": nm_val,
+        # NM já formatado (ex.: 12.773.524)
+        "NM": nm_fmt,
         "Descrição": descricao,
         "NCM/SH": ncm,
         "CFOP": cfop,
         "UN": un,
-        # >>> mantém QTD como string com vírgula e 4 casas:
+        # QTD preservada com vírgula e 4 casas
         "QTD": qtd_str,
         "V. Unitário (R$)": v_unit,
         "V. Total (R$)": v_total
@@ -176,8 +195,7 @@ if pdf_file:
         st.warning("⚠️ Nenhum item identificado. Pode ser necessário ajustar o padrão de leitura.")
     else:
         df_itens = pd.DataFrame(itens)
-
-        # Ordena colunas para destacar IT/NM
+        # Ordena colunas destacando IT/NM e mantendo QTD como texto
         cols = ["Código", "IT", "NM", "Descrição", "NCM/SH", "CFOP", "UN", "QTD", "V. Unitário (R$)", "V. Total (R$)"]
         df_itens = df_itens.reindex(columns=[c for c in cols if c in df_itens.columns])
 
@@ -196,8 +214,7 @@ if pdf_file:
             st.success(f"{len(df_sel)} item(ns) selecionado(s)!")
             st.dataframe(df_sel, use_container_width=True)
 
-            # Exportar Excel (mantendo QTD como texto)
-            # Dica: para garantir que o Excel não converta, podemos deixar como texto mesmo.
+            # Exportar Excel (mantendo QTD como texto e NM já formatado)
             excel_output = io.BytesIO()
             df_sel.to_excel(excel_output, index=False)
             excel_output.seek(0)
