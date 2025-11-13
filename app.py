@@ -30,26 +30,31 @@ def to_float_br(s: str) -> float:
 
 def format_nm(nm_text: str) -> str:
     """
-    Recebe algo como 'NM12773524' e devolve '12.773.524'.
-    Regra: extrai dígitos; se tiver 8 dígitos, aplica máscara 2-3-3.
-    Caso tenha outro tamanho, faz group de milhar padrão.
+    'NM12773524' -> '12.773.524' (2-3-3). Fallback: separação por milhares.
     """
     if not nm_text:
         return None
-    # extrai dígitos
     digits = ''.join(re.findall(r'\d', nm_text))
     if len(digits) == 8:
         return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
-    # fallback: milhar
-    # inverte, insere pontos a cada 3, volta ao normal
+    # fallback: milhar padrão
     rev = digits[::-1]
     chunks = [rev[i:i+3] for i in range(0, len(rev), 3)]
     return '.'.join(ch[::-1] for ch in chunks[::-1]) if digits else None
 
+def format_it(it_text: str) -> str:
+    """
+    Normaliza IT: 'IT200' ou 'IT 200' -> '200' (apenas dígitos).
+    """
+    if not it_text:
+        return None
+    digits = ''.join(re.findall(r'\d', it_text))
+    return digits or None
+
 def parse_item_bloco(bloco: str):
     """
-    Extrai: Código, IT, NM(formatado), Descrição, NCM, CFOP, UN, QTD (string PT-BR),
-            V. Unitário (float), V. Total (float)
+    Extrai: Código, IT (apenas dígitos), NM (formatado), Descrição, NCM, CFOP, UN,
+            QTD (string PT-BR), V. Unitário (float), V. Total (float).
     """
     # 1) Código + "miolo" + NCM + CFOP
     m = re.search(
@@ -60,27 +65,30 @@ def parse_item_bloco(bloco: str):
         return None
 
     codigo = m.group('codigo').strip()
-    miolo = m.group('miolo').strip()  # contém "ITxxx - NMyyyyyy - Descrição"
+    miolo = m.group('miolo').strip()  # ex.: "IT180 - NM12773524 - VERTEBRA"
     ncm = m.group('ncm').strip()
     cfop = m.group('cfop').strip()
     resto = bloco[m.end():]
 
     # 2) IT e NM a partir do "miolo"
-    it_match = re.search(r'\b(IT\d+)\b', miolo)
-    nm_match = re.search(r'\b(NM\d+)\b', miolo)
+    # aceita IT com ou sem espaço: IT180 | IT 180
+    it_match = re.search(r'\bIT\s*\d+\b', miolo)
+    nm_match = re.search(r'\bNM\d+\b', miolo)
 
-    it_val = it_match.group(1) if it_match else None
-    nm_raw = nm_match.group(1) if nm_match else None
+    it_raw = it_match.group(0) if it_match else None
+    nm_raw = nm_match.group(0) if nm_match else None
+
+    it_val = format_it(it_raw) if it_raw else None
     nm_fmt = format_nm(nm_raw) if nm_raw else None
 
-    # 3) Descrição: remove ITxxx e NMxxxxxx e hifens excedentes
+    # 3) Descrição: remove IT e NM e hifens excedentes
     descricao = miolo
-    descricao = re.sub(r'\bIT\d+\b', '', descricao)
-    descricao = re.sub(r'\bNM\d+\b', '', descricao)
-    descricao = re.sub(r'\s*-\s*', ' - ', descricao)     # normaliza os hifens
+    descricao = re.sub(r'\bIT\s*\d+\b', '', descricao)  # remove IT com/sem espaço
+    descricao = re.sub(r'\bNM\d+\b', '', descricao)     # remove NM
+    descricao = re.sub(r'\s*-\s*', ' - ', descricao)    # normaliza hifens
     descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
-    # 4) QTD e UN (mantendo QTD no formato string PT-BR com vírgula)
+    # 4) QTD e UN (mantendo QTD no formato string PT-BR)
     qtd_str = None
     un = None
 
@@ -123,12 +131,12 @@ def parse_item_bloco(bloco: str):
                         if b <= 0 or b < a:
                             continue
                         err = abs(a * qtd_val - b)
-                        tol = max(0.001 * max(1.0, b), 0.05)  # tolerância
+                        tol = max(0.001 * max(1.0, b), 0.05)
                         if err < tol:
                             score = (err, -b)
                             if score < best_score:
                                 best_score = score
-                                best = (values[i][1], values[j][1])  # guarda os textos originais
+                                best = (values[i][1], values[j][1])  # textos originais
                 if best:
                     v_unit = to_float_br(best[0])
                     v_total = to_float_br(best[1])
@@ -137,15 +145,13 @@ def parse_item_bloco(bloco: str):
 
     return {
         "Código": codigo,
-        "IT": it_val,
-        # NM já formatado (ex.: 12.773.524)
-        "NM": nm_fmt,
+        "IT": it_val,          # << somente dígitos (ex.: '200')
+        "NM": nm_fmt,          # << ex.: '12.773.524'
         "Descrição": descricao,
         "NCM/SH": ncm,
         "CFOP": cfop,
         "UN": un,
-        # QTD preservada com vírgula e 4 casas
-        "QTD": qtd_str,
+        "QTD": qtd_str,        # mantido como '1,0000'
         "V. Unitário (R$)": v_unit,
         "V. Total (R$)": v_total
     }
@@ -195,7 +201,6 @@ if pdf_file:
         st.warning("⚠️ Nenhum item identificado. Pode ser necessário ajustar o padrão de leitura.")
     else:
         df_itens = pd.DataFrame(itens)
-        # Ordena colunas destacando IT/NM e mantendo QTD como texto
         cols = ["Código", "IT", "NM", "Descrição", "NCM/SH", "CFOP", "UN", "QTD", "V. Unitário (R$)", "V. Total (R$)"]
         df_itens = df_itens.reindex(columns=[c for c in cols if c in df_itens.columns])
 
@@ -214,7 +219,7 @@ if pdf_file:
             st.success(f"{len(df_sel)} item(ns) selecionado(s)!")
             st.dataframe(df_sel, use_container_width=True)
 
-            # Exportar Excel (mantendo QTD como texto e NM já formatado)
+            # Exportar Excel (QTD como texto e NM já formatado)
             excel_output = io.BytesIO()
             df_sel.to_excel(excel_output, index=False)
             excel_output.seek(0)
