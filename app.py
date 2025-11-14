@@ -23,8 +23,10 @@ with col_up2:
 # =========================
 # Utilitários
 # =========================
+# Números PT-BR, aceitando com/sem ponto de milhar
 NUM_RE = re.compile(r'(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4}')
 UNITS = ['UN', 'KG', 'PC', 'CJ', 'KIT', 'PAR', 'M', 'L', 'LT', 'CX']
+
 UNIT_QTD_RE = re.compile(
     r'(?P<qtd>(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4})\s*(?P<un>' + '|'.join(UNITS) + r')\b'
 )
@@ -200,6 +202,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                 pass
 
         # 7) Monta códigos
+        # Concatena sufixo (se houver) ao código bruto e adiciona 2ª linha no formatado
         codigo_raw = codigo_raw_base + (sufixo_clean or "")     # ex.: AC0703BJ10500004ITEM15
         codigo_fmt_base = format_codigo(codigo_raw_base)        # ex.: "BJ 105.00004"
         codigo_fmt = codigo_fmt_base + (f"\n{sufixo_clean}" if sufixo_clean else "")
@@ -208,8 +211,8 @@ def parse_nf_pdf(file) -> pd.DataFrame:
             "Código (Raw Base)": codigo_raw_base,  # opcional: rastreio
             "Código (Raw)": codigo_raw,            # com ITEMxx/POSxx concatenado
             "Código": codigo_fmt,                  # com quebra de linha
-            "IT": it_val,
-            "NM": nm_fmt,                          # chave de conciliação
+            "IT": it_val,                          # só dígitos
+            "NM": nm_fmt,                          # chave de conciliação (12.773.524)
             "Descrição (NF)": descricao,
             "NCM/SH": ncm,
             "CFOP": cfop,
@@ -241,7 +244,7 @@ def parse_ref_pdf(file) -> pd.DataFrame:
         if not m:
             continue
 
-        nm_fmt = format_nm(m.group('nm'))  # normaliza
+        nm_fmt = format_nm(m.group('nm'))  # normaliza para 12.773.524
         tail = m.group('resto')
 
         # Ex.: "... 2 UN 4419 JV-3A26-17-465-3"
@@ -265,7 +268,7 @@ def parse_ref_pdf(file) -> pd.DataFrame:
         rows.append({
             "NM": nm_fmt,
             "Texto breve material (REF)": desc_ref,
-            "QTD (REF)": qtd_ref,
+            "QTD (REF)": qtd_ref,      # mantém formato do PDF de referência
             "UM (REF)": um_ref,
             "Centro (REF)": centro,
             "Elemento PEP (REF)": pep,
@@ -314,36 +317,7 @@ else:
         df_nf, df_ref, on="NM", how="outer", indicator=True, suffixes=(" (NF)", " (REF)")
     )
 
-    # 🔧 Seletor de colunas
-    st.markdown("#### 🔧 Colunas a exibir")
-    all_cols = [c for c in df_merge.columns if c != "_merge"]
-    default_cols = [c for c in [
-        "NM", "Código", "Código (Raw)", "IT",
-        "Descrição (NF)", "NCM/SH", "CFOP", "UN (NF)", "QTD (NF)",
-        "Texto breve material (REF)", "UM (REF)", "QTD (REF)", "Centro (REF)", "Elemento PEP (REF)",
-        "V. Unitário (R$)", "V. Total (R$)"
-    ] if c in all_cols]
-
-    csel1, csel2 = st.columns([4, 2])
-    with csel1:
-        selected_cols = st.multiselect(
-            "Escolha as colunas para exibir nas tabelas e exportações:",
-            options=all_cols,
-            default=default_cols,
-            key="col_selector_merge"
-        )
-    with csel2:
-        col1b, col2b = st.columns(2)
-        with col1b:
-            if st.button("Selecionar tudo"):
-                selected_cols = all_cols
-        with col2b:
-            if st.button("Limpar"):
-                selected_cols = []
-
-    if not selected_cols:
-        selected_cols = ["NM"] if "NM" in all_cols else all_cols[:1]
-
+    # Métricas
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Conciliados (NM em ambos)", int((df_merge['_merge'] == 'both').sum()))
@@ -352,11 +326,12 @@ else:
     with c3:
         st.metric("Somente no PDF de referência", int((df_merge['_merge'] == 'right_only').sum()))
 
+    # Abas
     tab_both, tab_nf_only, tab_ref_only = st.tabs(["✔️ Conciliados", "📄 Somente NF", "📑 Somente REF"])
 
     with tab_both:
         df_both = df_merge[df_merge['_merge'] == 'both'].drop(columns=['_merge'])
-        df_both = df_both.reindex(columns=[c for c in selected_cols if c in df_both.columns])
+        # Tabela completa; use o "olho" da UI para ocultar/mostrar colunas
         st.dataframe(df_both, use_container_width=True)
         buf = io.BytesIO()
         df_both.to_excel(buf, index=False)
@@ -366,7 +341,6 @@ else:
 
     with tab_nf_only:
         df_l = df_merge[df_merge['_merge'] == 'left_only'].drop(columns=['_merge'])
-        df_l = df_l.reindex(columns=[c for c in selected_cols if c in df_l.columns])
         st.dataframe(df_l, use_container_width=True)
         buf_l = io.BytesIO()
         df_l.to_excel(buf_l, index=False)
@@ -376,7 +350,6 @@ else:
 
     with tab_ref_only:
         df_r = df_merge[df_merge['_merge'] == 'right_only'].drop(columns=['_merge'])
-        df_r = df_r.reindex(columns=[c for c in selected_cols if c in df_r.columns])
         st.dataframe(df_r, use_container_width=True)
         buf_r = io.BytesIO()
         df_r.to_excel(buf_r, index=False)
