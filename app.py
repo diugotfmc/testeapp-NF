@@ -26,10 +26,10 @@ with col_up2:
 NUM_RE = re.compile(r'(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4}')
 UNITS = ['UN', 'KG', 'PC', 'CJ', 'KIT', 'PAR', 'M', 'L', 'LT', 'CX']
 UNIT_QTD_RE = re.compile(
-    r'(?P<qtd>(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{2,4})?)\s*(?P<un>' + '|'.join(UNITS) + r')\b'
+    r'(?P<qtd>(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4})\s*(?P<un>' + '|'.join(UNITS) + r')\b'
 )
 UNIT_FIRST_RE = re.compile(
-    r'(?P<un>' + '|'.join(UNITS) + r')\s*(?P<qtd>(?:\d{1,3}(?:\.\d{3})+|\d+)(?:,\d{2,4})?)\b'
+    r'(?P<un>' + '|'.join(UNITS) + r')\s*(?P<qtd>(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4})\b'
 )
 
 def to_float_br(s: str) -> float:
@@ -38,19 +38,13 @@ def to_float_br(s: str) -> float:
 def format_nm(nm_text: str) -> str:
     """
     'NM12773524' -> '12.773.524' (2-3-3).
-    Para entradas já no formato '12.773.524' (do PDF de referência), re-normaliza para garantir padrão.
     """
     if not nm_text:
         return None
-    # Extrai dígitos
     digits = ''.join(re.findall(r'\d', nm_text))
-    # 8 dígitos -> 2-3-3
     if len(digits) == 8:
         return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
-    # Se já veio com pontos (ex.: 12.773.524), normaliza via dígitos
-    if len(digits) == 8:
-        return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
-    # Fallback (agrupamento por milhar)
+    # fallback: agrupamento por milhares
     rev = digits[::-1]
     chunks = [rev[i:i+3] for i in range(0, len(rev), 3)]
     return '.'.join(ch[::-1] for ch in chunks[::-1]) if digits else None
@@ -64,11 +58,11 @@ def format_it(it_text: str) -> str:
 
 def format_codigo(codigo_raw: str) -> str:
     """
-    Regras de formatação do Código:
-      - Se contiver 'BJ' + 8 dígitos: AC0505BJ08000200 -> BJ 080.00200
-      - Se contiver 'BJ' + (3+5): BJ02800629 -> BJ 028.00629
-      - Se contiver 'BX' + 3 dígitos: BX156 -> BX 156
-      - Caso não caiba nas regras, retorna original.
+    Formata o código da NF:
+      - '...BJ########...' -> 'BJ xxx.yyyyy'  (ex.: AC0505BJ08000200 -> BJ 080.00200)
+      - '...BJ(\d{3})(\d{5})...' -> 'BJ 028.00629'
+      - '...BX\d{3}...' -> 'BX 156'
+      - Caso contrário, retorna o original.
     """
     if not codigo_raw:
         return codigo_raw
@@ -93,47 +87,69 @@ def parse_nf_pdf(file) -> pd.DataFrame:
         for p in pdf.pages:
             texto += (p.extract_text() or "") + "\n"
 
-    linhas = [l.strip() for l in texto.splitlines() if l.strip()]
+    # Mantém as linhas originais para sabermos a "segunda linha" do item
+    linhas_brutas = [l for l in texto.splitlines() if l.strip()]
     padrao_inicio_item = re.compile(r"^[A-Z]{2,4}\d{2,}[A-Z0-9]*")
 
     blocos_itens, bloco_atual = [], []
-    for linha in linhas:
-        if padrao_inicio_item.match(linha):
+    for linha in linhas_brutas:
+        if padrao_inicio_item.match(linha.strip()):
             if bloco_atual:
-                blocos_itens.append(" ".join(bloco_atual))
+                blocos_itens.append(bloco_atual)  # lista de linhas do item
                 bloco_atual = []
-        if bloco_atual or padrao_inicio_item.match(linha):
+        if bloco_atual or padrao_inicio_item.match(linha.strip()):
             bloco_atual.append(linha)
     if bloco_atual:
-        blocos_itens.append(" ".join(bloco_atual))
+        blocos_itens.append(bloco_atual)
 
     itens = []
     for bloco in blocos_itens:
+        # Para regex principais, juntamos as linhas
+        bloco_text = " ".join([b.strip() for b in bloco])
+
+        # 1) Código + "miolo" + NCM + CFOP
         m = re.search(
             r'^(?P<codigo>[A-Z0-9]{2,}\d{2,}[A-Z0-9]*)\s+(?P<miolo>.+?)\s+(?P<ncm>\d{8})\s+\d{3}\s+(?P<cfop>\d{4})',
-            bloco
+            bloco_text
         )
         if not m:
             continue
 
-        codigo_raw = m.group('codigo').strip()
+        codigo_raw_base = m.group('codigo').strip()
         miolo = m.group('miolo').strip()   # "ITxxx - NMyyyyyy - Descrição"
         ncm = m.group('ncm').strip()
         cfop = m.group('cfop').strip()
-        resto = bloco[m.end():]
+        resto = bloco_text[m.end():]
 
+        # 2) IT e NM
         it_match = re.search(r'\bIT\s*\d+\b', miolo)
         nm_match = re.search(r'\bNM\d+\b', miolo)
+
         it_val = format_it(it_match.group(0)) if it_match else None
         nm_fmt = format_nm(nm_match.group(0)) if nm_match else None
 
+        # 3) Descrição limpa
         descricao = miolo
         descricao = re.sub(r'\bIT\s*\d+\b', '', descricao)
         descricao = re.sub(r'\bNM\d+\b', '', descricao)
         descricao = re.sub(r'\s*-\s*', ' - ', descricao)
         descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
-        # QTD (string) e UN
+        # 4) SUFIXO da 2ª linha: ITEMxx / POS xx
+        sufixo = None
+        if len(bloco) > 1:
+            m2 = re.search(r'\b(ITEM\s*\d+|POS\s*\d+)\b', bloco[1], flags=re.IGNORECASE)
+            if m2:
+                sufixo = m2.group(1)
+        if not sufixo and len(bloco) > 2:
+            for ln in bloco[2:]:
+                m_more = re.search(r'\b(ITEM\s*\d+|POS\s*\d+)\b', ln, flags=re.IGNORECASE)
+                if m_more:
+                    sufixo = m_more.group(1)
+                    break
+        sufixo_clean = re.sub(r'\s+', '', sufixo.upper()) if sufixo else None
+
+        # 5) QTD (string) e UN
         qtd_str, un = None, None
         m_q = UNIT_QTD_RE.search(resto)
         if m_q:
@@ -153,7 +169,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                     if m_num_prev:
                         qtd_str = m_num_prev[-1].group(0)
 
-        # VUnit/VTotal por consistência
+        # 6) V.Unit e V.Total por consistência
         v_unit, v_total = None, None
         if qtd_str:
             try:
@@ -166,7 +182,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                         a = values[i][0]
                         if a <= 0:
                             continue
-                        for j in range(i+1, len(values)):
+                        for j in range(i + 1, len(values)):
                             b = values[j][0]
                             if b <= 0 or b < a:
                                 continue
@@ -183,16 +199,22 @@ def parse_nf_pdf(file) -> pd.DataFrame:
             except Exception:
                 pass
 
+        # 7) Monta códigos
+        codigo_raw = codigo_raw_base + (sufixo_clean or "")     # p/ unicidade: AC... + ITEM15/POS8
+        codigo_fmt_base = format_codigo(codigo_raw_base)        # "BJ 105.00004"
+        codigo_fmt = codigo_fmt_base + (f"\n{sufixo_clean}" if sufixo_clean else "")
+
         itens.append({
-            "Código (Raw)": codigo_raw,
-            "Código": format_codigo(codigo_raw),
+            "Código (Raw Base)": codigo_raw_base,  # opcional: rastreio
+            "Código (Raw)": codigo_raw,            # ex.: AC0703BJ10500004ITEM15
+            "Código": codigo_fmt,                  # ex.: "BJ 105.00004\nITEM15"
             "IT": it_val,
-            "NM": nm_fmt,  # chave de conciliação
+            "NM": nm_fmt,                          # chave de conciliação
             "Descrição (NF)": descricao,
             "NCM/SH": ncm,
             "CFOP": cfop,
             "UN (NF)": un,
-            "QTD (NF)": qtd_str,  # manter como texto (ex.: 1,0000)
+            "QTD (NF)": qtd_str,                   # texto '1,0000'
             "V. Unitário (R$)": v_unit,
             "V. Total (R$)": v_total
         })
@@ -203,11 +225,6 @@ def parse_nf_pdf(file) -> pd.DataFrame:
 # Parser do PDF de referência (colunas)
 # =========================
 def parse_ref_pdf(file) -> pd.DataFrame:
-    """
-    Extrai linhas começando com NM no formato 12.773.524 e quebra em:
-      NM, Texto breve material, Qtd (REF), UM (REF), Centro, Elemento PEP
-    Ignora linhas que não seguem o padrão.
-    """
     texto = ""
     with pdfplumber.open(file) as pdf:
         for p in pdf.pages:
@@ -216,7 +233,6 @@ def parse_ref_pdf(file) -> pd.DataFrame:
     linhas = [l.strip() for l in texto.splitlines() if l.strip()]
     rows = []
     for ln in linhas:
-        # Começa com NM já pontuado (12.773.524 ...)
         m = re.match(r'^(?P<nm>\d{2}\.\d{3}\.\d{3})\s+(?P<resto>.+)$', ln)
         if not m:
             continue
@@ -224,8 +240,6 @@ def parse_ref_pdf(file) -> pd.DataFrame:
         nm_fmt = format_nm(m.group('nm'))  # normaliza
         tail = m.group('resto')
 
-        # Captura Qtd + UM + Centro + PEP (ao final da linha)
-        # Ex.: "... 2 UN 4419 JV-3A26-17-465-3"
         m_tail = re.search(
             r'(?P<qtd>(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d{3})?)\s+'
             r'(?P<um>' + '|'.join(UNITS) + r')\s+'
@@ -234,21 +248,18 @@ def parse_ref_pdf(file) -> pd.DataFrame:
             tail
         )
         if not m_tail:
-            # se não casar essa terminação, pula a linha (ou poderíamos logar)
             continue
 
         qtd_ref = m_tail.group('qtd')
         um_ref = m_tail.group('um')
         centro = m_tail.group('centro')
         pep = m_tail.group('pep')
-
-        # Descrição (REF) é o que sobrou antes de Qtd/UM/Centro/PEP
         desc_ref = tail[:m_tail.start()].strip()
 
         rows.append({
             "NM": nm_fmt,
             "Texto breve material (REF)": desc_ref,
-            "QTD (REF)": qtd_ref,        # mantido no padrão original do PDF
+            "QTD (REF)": qtd_ref,
             "UM (REF)": um_ref,
             "Centro (REF)": centro,
             "Elemento PEP (REF)": pep,
@@ -257,12 +268,11 @@ def parse_ref_pdf(file) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # =========================
-# Execução principal
+# Execução principal (painel + conciliação)
 # =========================
 df_nf = parse_nf_pdf(nf_file) if nf_file else pd.DataFrame()
 df_ref = parse_ref_pdf(ref_file) if ref_file else pd.DataFrame()
 
-# Painel NF isolado (opcional)
 with st.expander("Itens extraídos da NF", expanded=False):
     if not df_nf.empty:
         st.dataframe(df_nf, use_container_width=True)
@@ -274,7 +284,6 @@ with st.expander("Itens extraídos da NF", expanded=False):
     else:
         st.info("Envie uma NF-e em PDF para ver os itens extraídos.")
 
-# Painel REF isolado (opcional)
 with st.expander("Linhas do PDF de referência (colunas)", expanded=False):
     if not df_ref.empty:
         st.dataframe(df_ref, use_container_width=True)
@@ -286,16 +295,12 @@ with st.expander("Linhas do PDF de referência (colunas)", expanded=False):
     else:
         st.info("Envie o PDF em colunas para ver as linhas extraídas.")
 
-# =========================
-# Conciliação por NM
-# =========================
 st.markdown("---")
 st.subheader("📊 Painel de Conciliação por NM")
 
 if df_nf.empty or df_ref.empty:
     st.warning("Envie **os dois PDFs** (NF-e e Referência) para gerar a conciliação.")
 else:
-    # Merge por NM
     df_merge = pd.merge(
         df_nf, df_ref, on="NM", how="outer", indicator=True, suffixes=(" (NF)", " (REF)")
     )
@@ -308,7 +313,6 @@ else:
     with c3:
         st.metric("Somente no PDF de referência", int((df_merge['_merge'] == 'right_only').sum()))
 
-    # Abas com as três visões
     tab_both, tab_nf_only, tab_ref_only = st.tabs(["✔️ Conciliados", "📄 Somente NF", "📑 Somente REF"])
 
     with tab_both:
