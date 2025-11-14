@@ -78,22 +78,6 @@ def format_codigo(codigo_raw: str) -> str:
         return f"BX {m_bx3.group(1)}"
     return codigo_raw
 
-def pick_item_pos(*texts: str):
-    """
-    Busca 'ITEM <n>' ou 'POS <n>' nos textos informados,
-    normaliza (remove espaços/hífens, upper) e retorna o primeiro (ex.: 'ITEM15', 'POS7').
-    """
-    found = []
-    pat = re.compile(r'\b(ITEM\s*\d+|POS\s*\d+)\b', flags=re.IGNORECASE)
-    for t in texts:
-        if not t:
-            continue
-        for m in pat.finditer(t):
-            norm = re.sub(r'[\s\-]+', '', m.group(1).upper())
-            if norm not in found:
-                found.append(norm)
-    return found[0] if found else None
-
 # =========================
 # Parser da NF (itens)
 # =========================
@@ -103,7 +87,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
         for p in pdf.pages:
             texto += (p.extract_text() or "") + "\n"
 
-    # Mantém linhas originais (para capturar a "segunda linha" real)
+    # Mantém as linhas originais para sabermos a "segunda linha" do item
     linhas_brutas = [l for l in texto.splitlines() if l.strip()]
     padrao_inicio_item = re.compile(r"^[A-Z]{2,4}\d{2,}[A-Z0-9]*")
 
@@ -111,7 +95,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
     for linha in linhas_brutas:
         if padrao_inicio_item.match(linha.strip()):
             if bloco_atual:
-                blocos_itens.append(bloco_atual)  # lista de linhas
+                blocos_itens.append(bloco_atual)  # lista de linhas do item
                 bloco_atual = []
         if bloco_atual or padrao_inicio_item.match(linha.strip()):
             bloco_atual.append(linha)
@@ -120,6 +104,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
 
     itens = []
     for bloco in blocos_itens:
+        # Para regex principais, juntamos as linhas
         bloco_text = " ".join([b.strip() for b in bloco])
 
         # 1) Código + "miolo" + NCM + CFOP
@@ -150,14 +135,19 @@ def parse_nf_pdf(file) -> pd.DataFrame:
         descricao = re.sub(r'\s*-\s*', ' - ', descricao)
         descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
-        # 4) SUFIXO: ITEMxx / POSxx (2ª linha, demais linhas, ou mesma linha do item)
-        linha2 = bloco[1] if len(bloco) > 1 else None
-        linhas_restantes = "\n".join(bloco[2:]) if len(bloco) > 2 else None
-        sufixo_clean = (
-            pick_item_pos(linha2) or
-            pick_item_pos(linhas_restantes) or
-            pick_item_pos(resto)
-        )
+        # 4) SUFIXO da 2ª linha: ITEMxx / POS xx
+        sufixo = None
+        if len(bloco) > 1:
+            m2 = re.search(r'\b(ITEM\s*\d+|POS\s*\d+)\b', bloco[1], flags=re.IGNORECASE)
+            if m2:
+                sufixo = m2.group(1)
+        if not sufixo and len(bloco) > 2:
+            for ln in bloco[2:]:
+                m_more = re.search(r'\b(ITEM\s*\d+|POS\s*\d+)\b', ln, flags=re.IGNORECASE)
+                if m_more:
+                    sufixo = m_more.group(1)
+                    break
+        sufixo_clean = re.sub(r'\s+', '', sufixo.upper()) if sufixo else None
 
         # 5) QTD (string) e UN
         qtd_str, un = None, None
@@ -209,22 +199,22 @@ def parse_nf_pdf(file) -> pd.DataFrame:
             except Exception:
                 pass
 
-        # 7) Monta códigos com sufixo
-        codigo_raw = codigo_raw_base + (sufixo_clean or "")
-        codigo_fmt_base = format_codigo(codigo_raw_base)
+        # 7) Monta códigos
+        codigo_raw = codigo_raw_base + (sufixo_clean or "")     # p/ unicidade: AC... + ITEM15/POS8
+        codigo_fmt_base = format_codigo(codigo_raw_base)        # "BJ 105.00004"
         codigo_fmt = codigo_fmt_base + (f"\n{sufixo_clean}" if sufixo_clean else "")
 
         itens.append({
-            "Código (Raw Base)": codigo_raw_base,
-            "Código (Raw)": codigo_raw,
-            "Código": codigo_fmt,
+            "Código (Raw Base)": codigo_raw_base,  # opcional: rastreio
+            "Código (Raw)": codigo_raw,            # ex.: AC0703BJ10500004ITEM15
+            "Código": codigo_fmt,                  # ex.: "BJ 105.00004\nITEM15"
             "IT": it_val,
-            "NM": nm_fmt,   # chave da conciliação
+            "NM": nm_fmt,                          # chave de conciliação
             "Descrição (NF)": descricao,
             "NCM/SH": ncm,
             "CFOP": cfop,
             "UN (NF)": un,
-            "QTD (NF)": qtd_str,  # mantém '1,0000'
+            "QTD (NF)": qtd_str,                   # texto '1,0000'
             "V. Unitário (R$)": v_unit,
             "V. Total (R$)": v_total
         })
@@ -232,7 +222,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
     return pd.DataFrame(itens)
 
 # =========================
-# Parser do PDF de referência (colunas) — inalterado
+# Parser do PDF de referência (colunas)
 # =========================
 def parse_ref_pdf(file) -> pd.DataFrame:
     texto = ""
