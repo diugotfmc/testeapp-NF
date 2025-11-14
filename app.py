@@ -200,14 +200,14 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                 pass
 
         # 7) Monta códigos
-        codigo_raw = codigo_raw_base + (sufixo_clean or "")     # p/ unicidade: AC... + ITEM15/POS8
-        codigo_fmt_base = format_codigo(codigo_raw_base)        # "BJ 105.00004"
+        codigo_raw = codigo_raw_base + (sufixo_clean or "")     # ex.: AC0703BJ10500004ITEM15
+        codigo_fmt_base = format_codigo(codigo_raw_base)        # ex.: "BJ 105.00004"
         codigo_fmt = codigo_fmt_base + (f"\n{sufixo_clean}" if sufixo_clean else "")
 
         itens.append({
             "Código (Raw Base)": codigo_raw_base,  # opcional: rastreio
-            "Código (Raw)": codigo_raw,            # ex.: AC0703BJ10500004ITEM15
-            "Código": codigo_fmt,                  # ex.: "BJ 105.00004\nITEM15"
+            "Código (Raw)": codigo_raw,            # com ITEMxx/POSxx concatenado
+            "Código": codigo_fmt,                  # com quebra de linha
             "IT": it_val,
             "NM": nm_fmt,                          # chave de conciliação
             "Descrição (NF)": descricao,
@@ -225,6 +225,10 @@ def parse_nf_pdf(file) -> pd.DataFrame:
 # Parser do PDF de referência (colunas)
 # =========================
 def parse_ref_pdf(file) -> pd.DataFrame:
+    """
+    Extrai linhas começando com NM no formato 12.773.524 e quebra em:
+      NM, Texto breve material, Qtd (REF), UM (REF), Centro, Elemento PEP
+    """
     texto = ""
     with pdfplumber.open(file) as pdf:
         for p in pdf.pages:
@@ -240,6 +244,7 @@ def parse_ref_pdf(file) -> pd.DataFrame:
         nm_fmt = format_nm(m.group('nm'))  # normaliza
         tail = m.group('resto')
 
+        # Ex.: "... 2 UN 4419 JV-3A26-17-465-3"
         m_tail = re.search(
             r'(?P<qtd>(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d{3})?)\s+'
             r'(?P<um>' + '|'.join(UNITS) + r')\s+'
@@ -254,6 +259,7 @@ def parse_ref_pdf(file) -> pd.DataFrame:
         um_ref = m_tail.group('um')
         centro = m_tail.group('centro')
         pep = m_tail.group('pep')
+
         desc_ref = tail[:m_tail.start()].strip()
 
         rows.append({
@@ -268,11 +274,12 @@ def parse_ref_pdf(file) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # =========================
-# Execução principal (painel + conciliação)
+# Execução principal
 # =========================
 df_nf = parse_nf_pdf(nf_file) if nf_file else pd.DataFrame()
 df_ref = parse_ref_pdf(ref_file) if ref_file else pd.DataFrame()
 
+# Painel NF
 with st.expander("Itens extraídos da NF", expanded=False):
     if not df_nf.empty:
         st.dataframe(df_nf, use_container_width=True)
@@ -284,6 +291,7 @@ with st.expander("Itens extraídos da NF", expanded=False):
     else:
         st.info("Envie uma NF-e em PDF para ver os itens extraídos.")
 
+# Painel REF
 with st.expander("Linhas do PDF de referência (colunas)", expanded=False):
     if not df_ref.empty:
         st.dataframe(df_ref, use_container_width=True)
@@ -295,6 +303,7 @@ with st.expander("Linhas do PDF de referência (colunas)", expanded=False):
     else:
         st.info("Envie o PDF em colunas para ver as linhas extraídas.")
 
+# Conciliação
 st.markdown("---")
 st.subheader("📊 Painel de Conciliação por NM")
 
@@ -304,6 +313,36 @@ else:
     df_merge = pd.merge(
         df_nf, df_ref, on="NM", how="outer", indicator=True, suffixes=(" (NF)", " (REF)")
     )
+
+    # 🔧 Seletor de colunas
+    st.markdown("#### 🔧 Colunas a exibir")
+    all_cols = [c for c in df_merge.columns if c != "_merge"]
+    default_cols = [c for c in [
+        "NM", "Código", "Código (Raw)", "IT",
+        "Descrição (NF)", "NCM/SH", "CFOP", "UN (NF)", "QTD (NF)",
+        "Texto breve material (REF)", "UM (REF)", "QTD (REF)", "Centro (REF)", "Elemento PEP (REF)",
+        "V. Unitário (R$)", "V. Total (R$)"
+    ] if c in all_cols]
+
+    csel1, csel2 = st.columns([4, 2])
+    with csel1:
+        selected_cols = st.multiselect(
+            "Escolha as colunas para exibir nas tabelas e exportações:",
+            options=all_cols,
+            default=default_cols,
+            key="col_selector_merge"
+        )
+    with csel2:
+        col1b, col2b = st.columns(2)
+        with col1b:
+            if st.button("Selecionar tudo"):
+                selected_cols = all_cols
+        with col2b:
+            if st.button("Limpar"):
+                selected_cols = []
+
+    if not selected_cols:
+        selected_cols = ["NM"] if "NM" in all_cols else all_cols[:1]
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -317,6 +356,7 @@ else:
 
     with tab_both:
         df_both = df_merge[df_merge['_merge'] == 'both'].drop(columns=['_merge'])
+        df_both = df_both.reindex(columns=[c for c in selected_cols if c in df_both.columns])
         st.dataframe(df_both, use_container_width=True)
         buf = io.BytesIO()
         df_both.to_excel(buf, index=False)
@@ -326,6 +366,7 @@ else:
 
     with tab_nf_only:
         df_l = df_merge[df_merge['_merge'] == 'left_only'].drop(columns=['_merge'])
+        df_l = df_l.reindex(columns=[c for c in selected_cols if c in df_l.columns])
         st.dataframe(df_l, use_container_width=True)
         buf_l = io.BytesIO()
         df_l.to_excel(buf_l, index=False)
@@ -335,6 +376,7 @@ else:
 
     with tab_ref_only:
         df_r = df_merge[df_merge['_merge'] == 'right_only'].drop(columns=['_merge'])
+        df_r = df_r.reindex(columns=[c for c in selected_cols if c in df_r.columns])
         st.dataframe(df_r, use_container_width=True)
         buf_r = io.BytesIO()
         df_r.to_excel(buf_r, index=False)
