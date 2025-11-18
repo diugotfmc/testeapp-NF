@@ -8,8 +8,8 @@ import io
 # Configuração e Título
 # =========================
 st.set_page_config(page_title="Leitor e Conciliação de NF por NM", layout="wide")
-st.title("📄 Leitor de Nota Fiscal (PDF) + 🔗 Conciliação por NM (TXT por linha)")
-st.caption("Extrai itens da NF (PDF) e cruza com um TXT tabular (1 linha = 1 item), usando NM como chave.")
+st.title("📄 Leitor de Nota Fiscal (PDF) + 🔗 Conciliação por NM (TXT | pipe)")
+st.caption("Extrai itens da NF e relaciona com um TXT delimitado por '|', usando NM como chave.")
 
 # =========================
 # Uploads
@@ -18,12 +18,12 @@ col_up1, col_up2 = st.columns(2)
 with col_up1:
     nf_file = st.file_uploader("NF-e (PDF)", type=["pdf"], key="nf")
 with col_up2:
-    txt_file = st.file_uploader("TXT de referência (1 linha = 1 item)", type=["txt"], key="txt_ref")
+    txt_file = st.file_uploader("TXT de referência (delimitado por |)", type=["txt"], key="txt_ref")
 
 # =========================
 # Utilitários
 # =========================
-NUM_RE = re.compile(r'(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4}')
+NUM_RE = re.compile(r'(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4}')  # números PT-BR
 UNITS = ['UN', 'KG', 'PC', 'CJ', 'KIT', 'PAR', 'M', 'L', 'LT', 'CX']
 
 UNIT_QTD_RE = re.compile(
@@ -38,15 +38,14 @@ def to_float_br(s: str) -> float:
 
 def format_nm(nm_text: str) -> str:
     """
-    'NM12773524' -> '12.773.524' (2-3-3).
-    Aceita também '12773524' ou '12.773.524'.
+    'NM12773524' -> '12.773.524' (2-3-3) ou normaliza '12.773.524' se já vier assim.
     """
     if not nm_text:
         return None
-    digits = ''.join(re.findall(r'\d', str(nm_text)))
+    digits = ''.join(re.findall(r'\d', nm_text))
     if len(digits) == 8:
         return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
-    # fallback: agrupamento por milhares (mantém algo legível mesmo fora do padrão)
+    # fallback: milhar
     rev = digits[::-1]
     chunks = [rev[i:i+3] for i in range(0, len(rev), 3)]
     return '.'.join(ch[::-1] for ch in chunks[::-1]) if digits else None
@@ -81,17 +80,19 @@ def format_codigo(codigo_raw: str) -> str:
     return codigo_raw
 
 # =========================
-# NF (PDF) -> DataFrame
+# Parser da NF (PDF)
 # =========================
 def parse_nf_pdf(file) -> pd.DataFrame:
     if file is None:
         return pd.DataFrame()
 
+    # Extrai texto do PDF
     texto = ""
     with pdfplumber.open(file) as pdf:
         for p in pdf.pages:
             texto += (p.extract_text() or "") + "\n"
 
+    # Mantém as linhas originais (para capturar sufixo da 2ª linha)
     linhas_brutas = [l for l in texto.splitlines() if l.strip()]
     padrao_inicio_item = re.compile(r"^[A-Z]{2,4}\d{2,}[A-Z0-9]*")
 
@@ -99,7 +100,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
     for linha in linhas_brutas:
         if padrao_inicio_item.match(linha.strip()):
             if bloco_atual:
-                blocos_itens.append(bloco_atual)
+                blocos_itens.append(bloco_atual)  # lista de linhas do item
                 bloco_atual = []
         if bloco_atual or padrao_inicio_item.match(linha.strip()):
             bloco_atual.append(linha)
@@ -110,6 +111,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
     for bloco in blocos_itens:
         bloco_text = " ".join([b.strip() for b in bloco])
 
+        # 1) Código + "miolo" + NCM + CFOP
         m = re.search(
             r'^(?P<codigo>[A-Z0-9]{2,}\d{2,}[A-Z0-9]*)\s+(?P<miolo>.+?)\s+(?P<ncm>\d{8})\s+\d{3}\s+(?P<cfop>\d{4})',
             bloco_text
@@ -118,22 +120,26 @@ def parse_nf_pdf(file) -> pd.DataFrame:
             continue
 
         codigo_raw_base = m.group('codigo').strip()
-        miolo = m.group('miolo').strip()
+        miolo = m.group('miolo').strip()   # "ITxxx - NMyyyyyy - Descrição"
         ncm = m.group('ncm').strip()
         cfop = m.group('cfop').strip()
         resto = bloco_text[m.end():]
 
+        # 2) IT e NM
         it_match = re.search(r'\bIT\s*\d+\b', miolo)
         nm_match = re.search(r'\bNM\d+\b', miolo)
+
         it_val = format_it(it_match.group(0)) if it_match else None
         nm_fmt = format_nm(nm_match.group(0)) if nm_match else None
 
+        # 3) Descrição limpa
         descricao = miolo
         descricao = re.sub(r'\bIT\s*\d+\b', '', descricao)
         descricao = re.sub(r'\bNM\d+\b', '', descricao)
         descricao = re.sub(r'\s*-\s*', ' - ', descricao)
         descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
+        # 4) SUFIXO da 2ª linha: ITEMxx / POS xx
         sufixo = None
         if len(bloco) > 1:
             m2 = re.search(r'\b(ITEM\s*\d+|POS\s*\d+)\b', bloco[1], flags=re.IGNORECASE)
@@ -147,6 +153,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                     break
         sufixo_clean = re.sub(r'\s+', '', sufixo.upper()) if sufixo else None
 
+        # 5) QTD (string) e UN
         qtd_str, un = None, None
         m_q = UNIT_QTD_RE.search(resto)
         if m_q:
@@ -166,7 +173,8 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                     if m_num_prev:
                         qtd_str = m_num_prev[-1].group(0)
 
-        v_unit = v_total = None
+        # 6) V.Unit e V.Total por consistência
+        v_unit, v_total = None, None
         if qtd_str:
             try:
                 qtd_val = to_float_br(qtd_str)
@@ -195,21 +203,22 @@ def parse_nf_pdf(file) -> pd.DataFrame:
             except Exception:
                 pass
 
-        codigo_raw = codigo_raw_base + (sufixo_clean or "")
-        codigo_fmt_base = format_codigo(codigo_raw_base)
+        # 7) Monta códigos
+        codigo_raw = codigo_raw_base + (sufixo_clean or "")     # ex.: AC0703BJ10500004ITEM15
+        codigo_fmt_base = format_codigo(codigo_raw_base)        # ex.: "BJ 105.00004"
         codigo_fmt = codigo_fmt_base + (f"\n{sufixo_clean}" if sufixo_clean else "")
 
         itens.append({
             "Código (Raw Base)": codigo_raw_base,
             "Código (Raw)": codigo_raw,
             "Código": codigo_fmt,
-            "IT": it_val,
-            "NM": nm_fmt,
+            "IT": it_val,                 # só dígitos
+            "NM": nm_fmt,                 # chave de conciliação
             "Descrição (NF)": descricao,
             "NCM/SH": ncm,
             "CFOP": cfop,
             "UN (NF)": un,
-            "QTD (NF)": qtd_str,
+            "QTD (NF)": qtd_str,          # texto '1,0000'
             "V. Unitário (R$)": v_unit,
             "V. Total (R$)": v_total
         })
@@ -217,100 +226,19 @@ def parse_nf_pdf(file) -> pd.DataFrame:
     return pd.DataFrame(itens)
 
 # =========================
-# TXT por linha -> DataFrame (auto-detecta delimitador e cabeçalho)
+# Parser do TXT (pipe |) de referência
 # =========================
-def detect_delimiter(sample: str, candidates=(';', '\t', '|', ',')) -> str | None:
+def parse_ref_txt_pipe(file) -> pd.DataFrame:
     """
-    Heurística: escolhe o delimitador que produz o maior 'modo' de contagem de colunas
-    nas primeiras linhas não vazias, privilegiando consistência.
-    """
-    lines = [ln for ln in sample.splitlines() if ln.strip()]
-    lines = lines[:50]  # amostra
-    best = (None, 0, 0)  # (sep, mode_cols, valid_lines)
-    for sep in candidates:
-        counts = []
-        for ln in lines:
-            parts = ln.split(sep)
-            counts.append(len(parts))
-        if not counts:
-            continue
-        # modo (tamanho de coluna mais frequente)
-        from collections import Counter
-        c = Counter(counts)
-        mode_cols, freq = max(c.items(), key=lambda x: (x[1], x[0]))
-        # guardamos também quantas linhas têm exatamente mode_cols
-        valid = sum(1 for k in counts if k == mode_cols)
-        score = (mode_cols, valid)
-        if score > (best[1], best[2]):
-            best = (sep, mode_cols, valid)
-    return best[0]
-
-def normalize_ref_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normaliza nomes de colunas do TXT para o padrão:
-    ['NM','Texto breve material (REF)','QTD (REF)','UM (REF)','Centro (REF)','Elemento PEP (REF)']
-    Aceita variações de header; se não houver header, assume ordem das 6 colunas.
-    """
-    # Se não há nomes (ou nomes são 0..N-1), tratamos como sem header
-    has_header = not all(isinstance(c, int) for c in df.columns)
-
-    # Mapa de nomes -> padrão
-    def norm(s): return re.sub(r'[^a-z0-9]+', '', str(s).strip().lower())
-    target = {
-        'nm': 'NM',
-        'material': 'NM',
-        'texto_breve_material': 'Texto breve material (REF)',
-        'textobrevematerial': 'Texto breve material (REF)',
-        'descricaomaterial': 'Texto breve material (REF)',
-        'qtd': 'QTD (REF)',
-        'qtd.': 'QTD (REF)',
-        'quantidade': 'QTD (REF)',
-        'um': 'UM (REF)',
-        'umr': 'UM (REF)',
-        'unidade': 'UM (REF)',
-        'cen.': 'Centro (REF)',
-        'cen': 'Centro (REF)',
-        'centro': 'Centro (REF)',
-        'elementopep': 'Elemento PEP (REF)',
-        'pep': 'Elemento PEP (REF)',
-    }
-
-    if has_header:
-        newcols = []
-        for c in df.columns:
-            key = norm(c)
-            newcols.append(target.get(key, str(c).strip()))
-        df.columns = newcols
-
-    # Se ainda não temos todas as 6 colunas, e a contagem bate com 6, assume ordem fixa
-    expected = ['NM', 'Texto breve material (REF)', 'QTD (REF)', 'UM (REF)', 'Centro (REF)', 'Elemento PEP (REF)']
-    if not has_header and df.shape[1] == 6:
-        df.columns = expected
-
-    # Completa/renomeia o que faltou
-    rename_map = {}
-    for c in df.columns:
-        key = norm(c)
-        if key in target:
-            rename_map[c] = target[key]
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # Se após o processo ainda estiver faltando algo essencial, falha (será tratado no chamador)
-    return df
-
-def parse_ref_txt_table(file) -> pd.DataFrame:
-    """
-    Lê um TXT tabular (1 linha = 1 item).
-    - Auto-detecta delimitador (entre ;, \\t, |, ,).
-    - Tenta header; se não houver, assume 6 colunas na ordem: NM, Descrição, Qtd, UM, Centro, PEP.
-    - Normaliza NM (12.773.524), mantém QTD como string.
+    Lê TXT delimitado por '|', com colunas:
+      Material | Texto breve material | Qtd. | UM (ou UMR) | Cen. | Elemento PEP
+    Ignora cabeçalhos/linhas de traços e linhas inválidas.
     """
     if file is None:
         return pd.DataFrame()
 
+    # decodificação robusta
     raw = file.read()
-    # detecta encoding
     if isinstance(raw, bytes):
         for enc in ("utf-8", "cp1252", "latin-1"):
             try:
@@ -323,47 +251,67 @@ def parse_ref_txt_table(file) -> pd.DataFrame:
     else:
         text = str(raw)
 
-    # detecta delimitador
-    sep = detect_delimiter(text)
-    if not sep:
-        # Se não detectar, tenta CSV padrão como último recurso
-        sep = ','
+    # quebra em linhas e filtra ruído
+    lines = [ln.strip() for ln in text.splitlines()]
+    # remove linhas vazias e separadores longos
+    sep_re = re.compile(r'^[\-\=\*_\\\/\s]{5,}$')
+    lines = [ln for ln in lines if ln and not sep_re.match(ln)]
 
-    # Tenta com header
-    try:
-        df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, keep_default_na=False)
-    except Exception:
-        # fallback: tenta sem header
-        df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, header=None, keep_default_na=False)
+    rows = []
+    header_seen = False
 
-    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    df = normalize_ref_columns(df)
+    for ln in lines:
+        # precisa ter pipe
+        if '|' not in ln:
+            continue
 
-    # Se colunas essenciais não existem, tentar sem header com 6 colunas
-    essentials = {'NM', 'Texto breve material (REF)', 'QTD (REF)', 'UM (REF)', 'Centro (REF)', 'Elemento PEP (REF)'}
-    if not essentials.issubset(set(df.columns)) and df.shape[1] == 6:
-        df.columns = ['NM', 'Texto breve material (REF)', 'QTD (REF)', 'UM (REF)', 'Centro (REF)', 'Elemento PEP (REF)']
+        # remove pipes extras nas bordas e divide por pipe tolerante a espaços
+        ln_clean = ln.strip().strip('|').strip()
+        parts = [p.strip() for p in re.split(r'\s*\|\s*', ln_clean)]
 
-    # Valida novamente
-    if not essentials.issubset(set(df.columns)):
-        st.error("Não foi possível identificar as colunas do TXT. Verifique o cabeçalho e o delimitador (;, TAB, | ou ,).")
-        return pd.DataFrame()
+        # Detecta e ignora header (ex.: Material|Texto breve material|Qtd.|UMR|Cen.|Elemento PEP)
+        if not header_seen and len(parts) >= 2:
+            if parts[0].lower().startswith('material') and 'texto' in parts[1].lower():
+                header_seen = True
+                continue
 
-    # Normaliza NM e mantém QTD textual
-    df['NM'] = df['NM'].map(format_nm)
-    # Remove linhas sem NM válida
-    df = df[df['NM'].notna() & (df['NM'].str.len() > 0)]
+        # Espera pelo menos 6 colunas de dados
+        if len(parts) < 6:
+            continue
 
-    # Opcional: normaliza UM para maiúsculas
-    df['UM (REF)'] = df['UM (REF)'].str.upper()
+        material, desc, qtd, um, centro, pep = parts[:6]
 
-    return df.reset_index(drop=True)
+        # valida material (NM) no formato 12.773.524 (com pontos) ou somente dígitos
+        m_ok = re.match(r'^\d{2}\.\d{3}\.\d{3}$', material) or re.match(r'^\d{8}$', re.sub(r'\D', '', material))
+        if not m_ok:
+            continue
+
+        # validações suaves para os demais (não bloqueiam se vierem com pequenas variações)
+        if not qtd:
+            continue
+        if not um:
+            continue
+        if not centro:
+            continue
+        if not pep:
+            continue
+
+        rows.append({
+            "NM": format_nm(material),
+            "Texto breve material (REF)": desc,
+            "QTD (REF)": qtd,          # mantém como texto (ex.: '100,000')
+            "UM (REF)": um,            # aceita UM/UMR
+            "Centro (REF)": centro,
+            "Elemento PEP (REF)": pep
+        })
+
+    return pd.DataFrame(rows)
 
 # =========================
 # Execução principal
 # =========================
 df_nf  = parse_nf_pdf(nf_file) if nf_file else pd.DataFrame()
-df_ref = parse_ref_txt_table(txt_file) if txt_file else pd.DataFrame()
+df_ref = parse_ref_txt_pipe(txt_file) if txt_file else pd.DataFrame()
 
 # Painel NF
 with st.expander("Itens extraídos da NF", expanded=False):
@@ -378,7 +326,7 @@ with st.expander("Itens extraídos da NF", expanded=False):
         st.info("Envie uma NF (PDF) para ver os itens extraídos.")
 
 # Painel TXT de referência
-with st.expander("Linhas do TXT de referência (colunas)", expanded=False):
+with st.expander("Linhas do TXT de referência (pipe '|')", expanded=False):
     if not df_ref.empty:
         st.dataframe(df_ref, use_container_width=True)
         buf_ref = io.BytesIO()
@@ -387,9 +335,9 @@ with st.expander("Linhas do TXT de referência (colunas)", expanded=False):
         st.download_button("📥 Baixar Referência (Excel)", buf_ref, "referencia_itens.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
-        st.info("Envie o TXT tabular (1 linha = 1 item) para ver as linhas extraídas.")
+        st.info("Envie o TXT de referência delimitado por '|' no padrão informado.")
 
-# Conciliação por NM
+# Conciliação
 st.markdown("---")
 st.subheader("📊 Painel de Conciliação por NM")
 
@@ -400,6 +348,7 @@ else:
         df_nf, df_ref, on="NM", how="outer", indicator=True, suffixes=(" (NF)", " (REF)")
     )
 
+    # Métricas
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Conciliados (NM em ambos)", int((df_merge['_merge'] == 'both').sum()))
@@ -408,6 +357,7 @@ else:
     with c3:
         st.metric("Somente no TXT", int((df_merge['_merge'] == 'right_only').sum()))
 
+    # Abas (use o "olho" para ocultar/mostrar colunas)
     tab_both, tab_nf_only, tab_ref_only = st.tabs(["✔️ Conciliados", "📄 Somente NF", "📑 Somente TXT"])
 
     with tab_both:
