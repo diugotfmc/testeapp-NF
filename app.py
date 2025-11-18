@@ -7,23 +7,22 @@ import io
 # =========================
 # Configuração e Título
 # =========================
-st.set_page_config(page_title="Leitor de NF + Tabela TXT (Conciliação por NM)", layout="wide")
-st.title("📄 Leitor de NF (PDF) + 📑 Tabela do TXT de referência → 🔗 Conciliação por NM")
-st.caption("Primeiro gere a tabela do TXT, depois cruze com a NF usando NM como chave.")
+st.set_page_config(page_title="Leitor e Conciliação de NF por NM", layout="wide")
+st.title("📄 Leitor de Nota Fiscal (PDF) + 🔗 Conciliação por NM (TXT por linha)")
+st.caption("Extrai itens da NF (PDF) e cruza com um TXT tabular (1 linha = 1 item), usando NM como chave.")
 
 # =========================
 # Uploads
 # =========================
 col_up1, col_up2 = st.columns(2)
 with col_up1:
-    txt_file = st.file_uploader("1) Envie o TXT de referência (padrão em 6 linhas por item)", type=["txt"], key="txt_ref")
+    nf_file = st.file_uploader("NF-e (PDF)", type=["pdf"], key="nf")
 with col_up2:
-    nf_file = st.file_uploader("2) Envie a NF-e (PDF)", type=["pdf"], key="nf_pdf")
+    txt_file = st.file_uploader("TXT de referência (1 linha = 1 item)", type=["txt"], key="txt_ref")
 
 # =========================
 # Utilitários
 # =========================
-# Números PT-BR, aceitando com/sem ponto de milhar
 NUM_RE = re.compile(r'(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2,4}')
 UNITS = ['UN', 'KG', 'PC', 'CJ', 'KIT', 'PAR', 'M', 'L', 'LT', 'CX']
 
@@ -39,14 +38,15 @@ def to_float_br(s: str) -> float:
 
 def format_nm(nm_text: str) -> str:
     """
-    'NM12773524' -> '12.773.524' (2-3-3). Se já vier '12.773.524', mantém o padrão.
+    'NM12773524' -> '12.773.524' (2-3-3).
+    Aceita também '12773524' ou '12.773.524'.
     """
     if not nm_text:
         return None
-    digits = ''.join(re.findall(r'\d', nm_text))
+    digits = ''.join(re.findall(r'\d', str(nm_text)))
     if len(digits) == 8:
         return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
-    # fallback: agrupamento por milhares
+    # fallback: agrupamento por milhares (mantém algo legível mesmo fora do padrão)
     rev = digits[::-1]
     chunks = [rev[i:i+3] for i in range(0, len(rev), 3)]
     return '.'.join(ch[::-1] for ch in chunks[::-1]) if digits else None
@@ -62,8 +62,8 @@ def format_codigo(codigo_raw: str) -> str:
     """
     Formata o código da NF:
       - '...BJ########...' -> 'BJ xxx.yyyyy'  (ex.: AC0505BJ08000200 -> BJ 080.00200)
-      - '...BJ(\d{3})(\d{5})...' -> 'BJ 028.00629'
-      - '...BX\d{3}...' -> 'BX 156'
+      - '...BJ(\\d{3})(\\d{5})...' -> 'BJ 028.00629'
+      - '...BX\\d{3}...' -> 'BX 156'
       - Caso contrário, retorna o original.
     """
     if not codigo_raw:
@@ -81,113 +81,17 @@ def format_codigo(codigo_raw: str) -> str:
     return codigo_raw
 
 # =========================
-# Parser do TXT de referência (padrão do arquivo enviado)
-# =========================
-def parse_ref_txt(file) -> pd.DataFrame:
-    """
-    Lê o TXT no mesmo padrão do arquivo fornecido:
-    - Blocos de 6 linhas por item:
-      1) NM (ex.: 12.753.068)
-      2) Descrição
-      3) Qtd (ex.: 100,000 ou 2)
-      4) UM  (KG, UN, ...)
-      5) Centro (ex.: 0803)
-      6) Elemento PEP (ex.: IN-3668-15-951-MRP)
-    - Ignora separadores/cabeçalhos/rodapés.
-    """
-    if file is None:
-        return pd.DataFrame()
-
-    # decodificação robusta (utf-8 -> cp1252 -> latin-1)
-    raw = file.read()
-    if isinstance(raw, bytes):
-        for enc in ("utf-8", "cp1252", "latin-1"):
-            try:
-                text = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            text = raw.decode("latin-1", errors="ignore")
-    else:
-        text = str(raw)
-
-    # Normaliza linhas e remove separadores/cabeçalhos/rodapés
-    lines = [ln.strip() for ln in text.splitlines()]
-    sep_re = re.compile(r'^[\-\=\*_\\\/\s]{5,}$')  # linhas só de traços/asteriscos/etc.
-    lines = [ln for ln in lines if ln and not sep_re.match(ln)]
-
-    # Matchers do padrão
-    nm_line_re   = re.compile(r'^\d{2}\.\d{3}\.\d{3}$')             # 12.753.068
-    qtd_line_re  = re.compile(r'^\d{1,3}(?:\.\d{3})*(?:,\d{1,4})?$') # 100,000 | 2 | 1.400,000
-    centro_re    = re.compile(r'^\d{3,5}$')                          # 0803
-    pep_re       = re.compile(r'^[A-Z0-9\-/\\]+$', re.IGNORECASE)    # IN-3668-15-951-MRP
-
-    rows, i, n = [], 0, len(lines)
-    while i < n:
-        # Encontra início de bloco (linha com NM pontuado)
-        if not nm_line_re.match(lines[i]):
-            i += 1
-            continue
-
-        nm_fmt = format_nm(lines[i])
-
-        # Coleta próximas 5 linhas "válidas" (pulando vazias ou separadores)
-        bucket = []
-        j = i + 1
-        while j < n and len(bucket) < 5:
-            if lines[j] and not sep_re.match(lines[j]):
-                bucket.append(lines[j])
-            j += 1
-
-        # Verifica se coletou 5 campos
-        if len(bucket) < 5:
-            break
-
-        desc, qtd, um, centro, pep = bucket[:5]
-
-        # validações mínimas para garantir o padrão
-        if not qtd_line_re.match(qtd):
-            i += 1
-            continue
-        if um not in UNITS:
-            i += 1
-            continue
-        if not centro_re.match(centro):
-            i += 1
-            continue
-        if not pep_re.match(pep):
-            i += 1
-            continue
-
-        rows.append({
-            "NM": nm_fmt,
-            "Texto breve material (REF)": desc,
-            "QTD (REF)": qtd,       # mantém como texto no padrão do TXT
-            "UM (REF)": um,
-            "Centro (REF)": centro,
-            "Elemento PEP (REF)": pep
-        })
-
-        # Avança o ponteiro até depois do bloco consumido
-        i = j
-
-    return pd.DataFrame(rows)
-
-# =========================
-# Parser da NF (PDF)
+# NF (PDF) -> DataFrame
 # =========================
 def parse_nf_pdf(file) -> pd.DataFrame:
     if file is None:
         return pd.DataFrame()
 
-    # Extrai texto do PDF
     texto = ""
     with pdfplumber.open(file) as pdf:
         for p in pdf.pages:
             texto += (p.extract_text() or "") + "\n"
 
-    # Mantém as linhas originais para sabermos a "segunda linha" do item
     linhas_brutas = [l for l in texto.splitlines() if l.strip()]
     padrao_inicio_item = re.compile(r"^[A-Z]{2,4}\d{2,}[A-Z0-9]*")
 
@@ -195,7 +99,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
     for linha in linhas_brutas:
         if padrao_inicio_item.match(linha.strip()):
             if bloco_atual:
-                blocos_itens.append(bloco_atual)  # lista de linhas do item
+                blocos_itens.append(bloco_atual)
                 bloco_atual = []
         if bloco_atual or padrao_inicio_item.match(linha.strip()):
             bloco_atual.append(linha)
@@ -204,10 +108,8 @@ def parse_nf_pdf(file) -> pd.DataFrame:
 
     itens = []
     for bloco in blocos_itens:
-        # Para regex principais, juntamos as linhas
         bloco_text = " ".join([b.strip() for b in bloco])
 
-        # 1) Código + "miolo" + NCM + CFOP
         m = re.search(
             r'^(?P<codigo>[A-Z0-9]{2,}\d{2,}[A-Z0-9]*)\s+(?P<miolo>.+?)\s+(?P<ncm>\d{8})\s+\d{3}\s+(?P<cfop>\d{4})',
             bloco_text
@@ -216,26 +118,22 @@ def parse_nf_pdf(file) -> pd.DataFrame:
             continue
 
         codigo_raw_base = m.group('codigo').strip()
-        miolo = m.group('miolo').strip()   # "ITxxx - NMyyyyyy - Descrição"
+        miolo = m.group('miolo').strip()
         ncm = m.group('ncm').strip()
         cfop = m.group('cfop').strip()
         resto = bloco_text[m.end():]
 
-        # 2) IT e NM
         it_match = re.search(r'\bIT\s*\d+\b', miolo)
         nm_match = re.search(r'\bNM\d+\b', miolo)
-
         it_val = format_it(it_match.group(0)) if it_match else None
         nm_fmt = format_nm(nm_match.group(0)) if nm_match else None
 
-        # 3) Descrição limpa
         descricao = miolo
         descricao = re.sub(r'\bIT\s*\d+\b', '', descricao)
         descricao = re.sub(r'\bNM\d+\b', '', descricao)
         descricao = re.sub(r'\s*-\s*', ' - ', descricao)
         descricao = re.sub(r'\s{2,}', ' ', descricao).strip(' -')
 
-        # 4) SUFIXO da 2ª linha: ITEMxx / POS xx
         sufixo = None
         if len(bloco) > 1:
             m2 = re.search(r'\b(ITEM\s*\d+|POS\s*\d+)\b', bloco[1], flags=re.IGNORECASE)
@@ -249,7 +147,6 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                     break
         sufixo_clean = re.sub(r'\s+', '', sufixo.upper()) if sufixo else None
 
-        # 5) QTD (string) e UN
         qtd_str, un = None, None
         m_q = UNIT_QTD_RE.search(resto)
         if m_q:
@@ -269,8 +166,7 @@ def parse_nf_pdf(file) -> pd.DataFrame:
                     if m_num_prev:
                         qtd_str = m_num_prev[-1].group(0)
 
-        # 6) V.Unit e V.Total por consistência
-        v_unit, v_total = None, None
+        v_unit = v_total = None
         if qtd_str:
             try:
                 qtd_val = to_float_br(qtd_str)
@@ -299,22 +195,21 @@ def parse_nf_pdf(file) -> pd.DataFrame:
             except Exception:
                 pass
 
-        # 7) Monta códigos
-        codigo_raw = codigo_raw_base + (sufixo_clean or "")     # ex.: AC0703BJ10500004ITEM15
-        codigo_fmt_base = format_codigo(codigo_raw_base)        # ex.: "BJ 105.00004"
+        codigo_raw = codigo_raw_base + (sufixo_clean or "")
+        codigo_fmt_base = format_codigo(codigo_raw_base)
         codigo_fmt = codigo_fmt_base + (f"\n{sufixo_clean}" if sufixo_clean else "")
 
         itens.append({
-            "Código (Raw Base)": codigo_raw_base,  # opcional: rastreio
-            "Código (Raw)": codigo_raw,            # com ITEMxx/POSxx concatenado
-            "Código": codigo_fmt,                  # com quebra de linha
-            "IT": it_val,                          # só dígitos
-            "NM": nm_fmt,                          # chave de conciliação (12.773.524)
+            "Código (Raw Base)": codigo_raw_base,
+            "Código (Raw)": codigo_raw,
+            "Código": codigo_fmt,
+            "IT": it_val,
+            "NM": nm_fmt,
             "Descrição (NF)": descricao,
             "NCM/SH": ncm,
             "CFOP": cfop,
             "UN (NF)": un,
-            "QTD (NF)": qtd_str,                   # texto '1,0000'
+            "QTD (NF)": qtd_str,
             "V. Unitário (R$)": v_unit,
             "V. Total (R$)": v_total
         })
@@ -322,46 +217,184 @@ def parse_nf_pdf(file) -> pd.DataFrame:
     return pd.DataFrame(itens)
 
 # =========================
-# 1) Ler TXT e GERAR TABELA (antes de qualquer cruzamento)
+# TXT por linha -> DataFrame (auto-detecta delimitador e cabeçalho)
 # =========================
-df_ref = parse_ref_txt(txt_file) if txt_file else pd.DataFrame()
+def detect_delimiter(sample: str, candidates=(';', '\t', '|', ',')) -> str | None:
+    """
+    Heurística: escolhe o delimitador que produz o maior 'modo' de contagem de colunas
+    nas primeiras linhas não vazias, privilegiando consistência.
+    """
+    lines = [ln for ln in sample.splitlines() if ln.strip()]
+    lines = lines[:50]  # amostra
+    best = (None, 0, 0)  # (sep, mode_cols, valid_lines)
+    for sep in candidates:
+        counts = []
+        for ln in lines:
+            parts = ln.split(sep)
+            counts.append(len(parts))
+        if not counts:
+            continue
+        # modo (tamanho de coluna mais frequente)
+        from collections import Counter
+        c = Counter(counts)
+        mode_cols, freq = max(c.items(), key=lambda x: (x[1], x[0]))
+        # guardamos também quantas linhas têm exatamente mode_cols
+        valid = sum(1 for k in counts if k == mode_cols)
+        score = (mode_cols, valid)
+        if score > (best[1], best[2]):
+            best = (sep, mode_cols, valid)
+    return best[0]
 
-st.subheader("📑 Tabela do TXT de referência (formato do seu arquivo)")
-if not df_ref.empty:
-    st.dataframe(df_ref, use_container_width=True)
-    # Download da tabela do TXT
-    buf_ref = io.BytesIO()
-    df_ref.to_excel(buf_ref, index=False)
-    buf_ref.seek(0)
-    st.download_button("📥 Baixar TXT (Excel)", buf_ref, "referencia_itens.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-else:
-    st.info("Envie o TXT para carregar a tabela.")
+def normalize_ref_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza nomes de colunas do TXT para o padrão:
+    ['NM','Texto breve material (REF)','QTD (REF)','UM (REF)','Centro (REF)','Elemento PEP (REF)']
+    Aceita variações de header; se não houver header, assume ordem das 6 colunas.
+    """
+    # Se não há nomes (ou nomes são 0..N-1), tratamos como sem header
+    has_header = not all(isinstance(c, int) for c in df.columns)
+
+    # Mapa de nomes -> padrão
+    def norm(s): return re.sub(r'[^a-z0-9]+', '', str(s).strip().lower())
+    target = {
+        'nm': 'NM',
+        'material': 'NM',
+        'texto_breve_material': 'Texto breve material (REF)',
+        'textobrevematerial': 'Texto breve material (REF)',
+        'descricaomaterial': 'Texto breve material (REF)',
+        'qtd': 'QTD (REF)',
+        'qtd.': 'QTD (REF)',
+        'quantidade': 'QTD (REF)',
+        'um': 'UM (REF)',
+        'umr': 'UM (REF)',
+        'unidade': 'UM (REF)',
+        'cen.': 'Centro (REF)',
+        'cen': 'Centro (REF)',
+        'centro': 'Centro (REF)',
+        'elementopep': 'Elemento PEP (REF)',
+        'pep': 'Elemento PEP (REF)',
+    }
+
+    if has_header:
+        newcols = []
+        for c in df.columns:
+            key = norm(c)
+            newcols.append(target.get(key, str(c).strip()))
+        df.columns = newcols
+
+    # Se ainda não temos todas as 6 colunas, e a contagem bate com 6, assume ordem fixa
+    expected = ['NM', 'Texto breve material (REF)', 'QTD (REF)', 'UM (REF)', 'Centro (REF)', 'Elemento PEP (REF)']
+    if not has_header and df.shape[1] == 6:
+        df.columns = expected
+
+    # Completa/renomeia o que faltou
+    rename_map = {}
+    for c in df.columns:
+        key = norm(c)
+        if key in target:
+            rename_map[c] = target[key]
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # Se após o processo ainda estiver faltando algo essencial, falha (será tratado no chamador)
+    return df
+
+def parse_ref_txt_table(file) -> pd.DataFrame:
+    """
+    Lê um TXT tabular (1 linha = 1 item).
+    - Auto-detecta delimitador (entre ;, \\t, |, ,).
+    - Tenta header; se não houver, assume 6 colunas na ordem: NM, Descrição, Qtd, UM, Centro, PEP.
+    - Normaliza NM (12.773.524), mantém QTD como string.
+    """
+    if file is None:
+        return pd.DataFrame()
+
+    raw = file.read()
+    # detecta encoding
+    if isinstance(raw, bytes):
+        for enc in ("utf-8", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            text = raw.decode("latin-1", errors="ignore")
+    else:
+        text = str(raw)
+
+    # detecta delimitador
+    sep = detect_delimiter(text)
+    if not sep:
+        # Se não detectar, tenta CSV padrão como último recurso
+        sep = ','
+
+    # Tenta com header
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, keep_default_na=False)
+    except Exception:
+        # fallback: tenta sem header
+        df = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, header=None, keep_default_na=False)
+
+    df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    df = normalize_ref_columns(df)
+
+    # Se colunas essenciais não existem, tentar sem header com 6 colunas
+    essentials = {'NM', 'Texto breve material (REF)', 'QTD (REF)', 'UM (REF)', 'Centro (REF)', 'Elemento PEP (REF)'}
+    if not essentials.issubset(set(df.columns)) and df.shape[1] == 6:
+        df.columns = ['NM', 'Texto breve material (REF)', 'QTD (REF)', 'UM (REF)', 'Centro (REF)', 'Elemento PEP (REF)']
+
+    # Valida novamente
+    if not essentials.issubset(set(df.columns)):
+        st.error("Não foi possível identificar as colunas do TXT. Verifique o cabeçalho e o delimitador (;, TAB, | ou ,).")
+        return pd.DataFrame()
+
+    # Normaliza NM e mantém QTD textual
+    df['NM'] = df['NM'].map(format_nm)
+    # Remove linhas sem NM válida
+    df = df[df['NM'].notna() & (df['NM'].str.len() > 0)]
+
+    # Opcional: normaliza UM para maiúsculas
+    df['UM (REF)'] = df['UM (REF)'].str.upper()
+
+    return df.reset_index(drop=True)
 
 # =========================
-# 2) Ler NF e também mostrar (opcional, antes do cruzamento)
+# Execução principal
 # =========================
-df_nf = parse_nf_pdf(nf_file) if nf_file else pd.DataFrame()
+df_nf  = parse_nf_pdf(nf_file) if nf_file else pd.DataFrame()
+df_ref = parse_ref_txt_table(txt_file) if txt_file else pd.DataFrame()
 
-st.subheader("📄 Itens extraídos da NF (PDF)")
-if not df_nf.empty:
-    st.dataframe(df_nf, use_container_width=True)
-    buf_nf = io.BytesIO()
-    df_nf.to_excel(buf_nf, index=False)
-    buf_nf.seek(0)
-    st.download_button("📥 Baixar NF (Excel)", buf_nf, "nf_itens.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-else:
-    st.info("Envie a NF em PDF para carregar os itens.")
+# Painel NF
+with st.expander("Itens extraídos da NF", expanded=False):
+    if not df_nf.empty:
+        st.dataframe(df_nf, use_container_width=True)
+        buf_nf = io.BytesIO()
+        df_nf.to_excel(buf_nf, index=False)
+        buf_nf.seek(0)
+        st.download_button("📥 Baixar NF (Excel)", buf_nf, "nf_itens.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info("Envie uma NF (PDF) para ver os itens extraídos.")
 
-# =========================
-# 3) Conciliação por NM (após TXT + NF)
-# =========================
+# Painel TXT de referência
+with st.expander("Linhas do TXT de referência (colunas)", expanded=False):
+    if not df_ref.empty:
+        st.dataframe(df_ref, use_container_width=True)
+        buf_ref = io.BytesIO()
+        df_ref.to_excel(buf_ref, index=False)
+        buf_ref.seek(0)
+        st.download_button("📥 Baixar Referência (Excel)", buf_ref, "referencia_itens.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info("Envie o TXT tabular (1 linha = 1 item) para ver as linhas extraídas.")
+
+# Conciliação por NM
 st.markdown("---")
-st.subheader("🔗 Conciliação por NM (TXT × NF)")
+st.subheader("📊 Painel de Conciliação por NM")
 
 if df_nf.empty or df_ref.empty:
-    st.warning("Para conciliar, envie **o TXT** e **a NF**.")
+    st.warning("Envie **os dois arquivos** (NF e TXT) para gerar a conciliação.")
 else:
     df_merge = pd.merge(
         df_nf, df_ref, on="NM", how="outer", indicator=True, suffixes=(" (NF)", " (REF)")
