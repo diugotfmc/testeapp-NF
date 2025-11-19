@@ -8,8 +8,8 @@ import io
 # Configuração e Título
 # =========================
 st.set_page_config(page_title="Leitor e Conciliação de NF por NM", layout="wide")
-st.title("📄 Leitor de Nota Fiscal (PDF) + 🔗 Conciliação por NM (TXT | pipe)")
-st.caption("Extrai itens da NF e relaciona com um TXT delimitado por '|', usando NM como chave.")
+st.title("📄 Leitor de Nota Fiscal (PDF) + 🔗 Conciliação por NM (TXT | pipe) + 🧩 Máscaras por item")
+st.caption("Extrai itens da NF e relaciona com um TXT delimitado por '|', usando NM como chave. Gera máscaras editáveis por item.")
 
 # =========================
 # Uploads
@@ -42,7 +42,7 @@ def format_nm(nm_text: str) -> str:
     """
     if not nm_text:
         return None
-    digits = ''.join(re.findall(r'\d', nm_text))
+    digits = ''.join(re.findall(r'\d', str(nm_text)))
     if len(digits) == 8:
         return f"{digits[:2]}.{digits[2:5]}.{digits[5:]}"
     # fallback: milhar
@@ -61,8 +61,8 @@ def format_codigo(codigo_raw: str) -> str:
     """
     Formata o código da NF:
       - '...BJ########...' -> 'BJ xxx.yyyyy'  (ex.: AC0505BJ08000200 -> BJ 080.00200)
-      - '...BJ(\\d{3})(\\d{5})...' -> 'BJ 028.00629'
-      - '...BX\\d{3}...' -> 'BX 156'
+      - '...BJ(\d{3})(\d{5})...' -> 'BJ 028.00629'
+      - '...BX\d{3}...' -> 'BX 156'
       - Caso contrário, retorna o original.
     """
     if not codigo_raw:
@@ -253,7 +253,6 @@ def parse_ref_txt_pipe(file) -> pd.DataFrame:
 
     # quebra em linhas e filtra ruído
     lines = [ln.strip() for ln in text.splitlines()]
-    # remove linhas vazias e separadores longos
     sep_re = re.compile(r'^[\-\=\*_\\\/\s]{5,}$')
     lines = [ln for ln in lines if ln and not sep_re.match(ln)]
 
@@ -261,46 +260,35 @@ def parse_ref_txt_pipe(file) -> pd.DataFrame:
     header_seen = False
 
     for ln in lines:
-        # precisa ter pipe
         if '|' not in ln:
             continue
 
-        # remove pipes extras nas bordas e divide por pipe tolerante a espaços
         ln_clean = ln.strip().strip('|').strip()
         parts = [p.strip() for p in re.split(r'\s*\|\s*', ln_clean)]
 
-        # Detecta e ignora header (ex.: Material|Texto breve material|Qtd.|UMR|Cen.|Elemento PEP)
+        # ignora header
         if not header_seen and len(parts) >= 2:
             if parts[0].lower().startswith('material') and 'texto' in parts[1].lower():
                 header_seen = True
                 continue
 
-        # Espera pelo menos 6 colunas de dados
         if len(parts) < 6:
             continue
 
         material, desc, qtd, um, centro, pep = parts[:6]
 
-        # valida material (NM) no formato 12.773.524 (com pontos) ou somente dígitos
+        # valida NM
         m_ok = re.match(r'^\d{2}\.\d{3}\.\d{3}$', material) or re.match(r'^\d{8}$', re.sub(r'\D', '', material))
         if not m_ok:
             continue
-
-        # validações suaves para os demais (não bloqueiam se vierem com pequenas variações)
-        if not qtd:
-            continue
-        if not um:
-            continue
-        if not centro:
-            continue
-        if not pep:
+        if not qtd or not um or not centro or not pep:
             continue
 
         rows.append({
             "NM": format_nm(material),
-            "Texto breve material (REF)": desc,
-            "QTD (REF)": qtd,          # mantém como texto (ex.: '100,000')
-            "UM (REF)": um,            # aceita UM/UMR
+            "Texto breve material (REF)": desc,   # MAIÚSCULAS serão aplicadas depois (Opção 2)
+            "QTD (REF)": qtd,                     # mantém como texto (ex.: '100,000')
+            "UM (REF)": um,                       # aceita UM/UMR
             "Centro (REF)": centro,
             "Elemento PEP (REF)": pep
         })
@@ -308,10 +296,14 @@ def parse_ref_txt_pipe(file) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # =========================
-# Execução principal
+# Execução principal: NF + REF
 # =========================
 df_nf  = parse_nf_pdf(nf_file) if nf_file else pd.DataFrame()
 df_ref = parse_ref_txt_pipe(txt_file) if txt_file else pd.DataFrame()
+
+# Opção 2: padroniza 'Texto breve material (REF)' em MAIÚSCULAS após montar df_ref
+if not df_ref.empty and "Texto breve material (REF)" in df_ref.columns:
+    df_ref["Texto breve material (REF)"] = df_ref["Texto breve material (REF)"].astype(str).str.upper()
 
 # Painel NF
 with st.expander("Itens extraídos da NF", expanded=False):
@@ -348,7 +340,6 @@ else:
         df_nf, df_ref, on="NM", how="outer", indicator=True, suffixes=(" (NF)", " (REF)")
     )
 
-    # Métricas
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Conciliados (NM em ambos)", int((df_merge['_merge'] == 'both').sum()))
@@ -357,7 +348,6 @@ else:
     with c3:
         st.metric("Somente no TXT", int((df_merge['_merge'] == 'right_only').sum()))
 
-    # Abas (use o "olho" para ocultar/mostrar colunas)
     tab_both, tab_nf_only, tab_ref_only = st.tabs(["✔️ Conciliados", "📄 Somente NF", "📑 Somente TXT"])
 
     with tab_both:
@@ -368,6 +358,97 @@ else:
         buf.seek(0)
         st.download_button("📥 Baixar Conciliados (Excel)", buf, "conciliados.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # =========================
+        # 🧩 Máscaras por item (conciliados por NM)
+        # =========================
+        st.markdown("### 🧩 Máscaras por item (conciliados por NM)")
+        st.caption("Edite os campos e copie/baixe cada máscara individualmente.")
+
+        # Itera por cada item conciliado e renderiza uma máscara editável
+        for idx, row in df_both.reset_index(drop=True).iterrows():
+            with st.expander(f"Máscara do item #{idx+1} — NM: {row.get('NM','')}", expanded=False):
+                # Campos vindos do merge (com defaults)
+                texto_breve_default = str(row.get("Texto breve material (REF", row.get("Texto breve material (REF)",""))).upper()
+                nm_default          = str(row.get("NM",""))
+                centro_default      = str(row.get("Centro (REF)",""))
+                codigo_default      = str(row.get("Código","")).replace("\n", " ")  # evita quebra no desenho
+                qtd_default         = str(row.get("QTD (NF)",""))
+                un_default          = str(row.get("UN (NF)",""))
+                pep_default         = str(row.get("Elemento PEP (REF)",""))
+
+                # Inputs editáveis (pré-preenchidos)
+                texto_breve = st.text_input("1 & 3) Texto breve material (REF)", value=texto_breve_default, key=f"tb_{idx}")
+                doc_chegada = st.text_input("2) DOCUMENTO DE CHEGADA", value="", key=f"dc_{idx}")
+                nota_petro  = st.text_input("4) NOTA PETROBRAS", value="", key=f"np_{idx}")
+                nota_base   = st.text_input("5) NOTA DE SAÍDA BASE", value="", key=f"nb_{idx}")
+                nota_pet_sa = st.text_input("6) NOTA DE SAÍDA PETROBRAS", value="", key=f"nps_{idx}")
+                csp         = st.text_input("7) N° DE CSP", value="", key=f"csp_{idx}")
+                projeto     = st.text_input("8) PROJETO", value="", key=f"prj_{idx}")
+                rt          = st.text_input("9) RT", value="N/A", key=f"rt_{idx}")
+                invent      = st.text_input("10) MATERIAL INVENTARIADO", value="SIM", key=f"inv_{idx}")
+                ferram      = st.text_input("11) FERRAMENTA", value="NÃO", key=f"fer_{idx}")
+                tag_bcds    = st.text_input("12) TAG BCDS DA FERRAMENTA", value="N/A", key=f"tag_{idx}")
+                nm_val      = st.text_input("13) NM", value=nm_default, key=f"nm_{idx}")
+                centro_val  = st.text_input("14) CENTRO (REF)", value=centro_default, key=f"cen_{idx}")
+                desenho     = st.text_input("15) DESENHO (Código NF)", value=codigo_default, key=f"des_{idx}")
+                imob        = st.text_input("16) IMOBILIZADO", value="N/A", key=f"imob_{idx}")
+                qtdnf       = st.text_input("17) QUANTIDADE (QTD NF)", value=qtd_default, key=f"qtd_{idx}")
+                unnf        = st.text_input("17) UN (NF)", value=un_default, key=f"un_{idx}")
+                caixa       = st.text_input("18) N° DE CAIXA", value="", key=f"cx_{idx}")
+                pep_val     = st.text_input("19) DIAGRAMA DE REDE / ELEMENTO PEP (REF)", value=pep_default, key=f"pep_{idx}")
+                ptm         = st.text_input("20) PTM", value="N/A", key=f"ptm_{idx}")
+                dsm         = st.text_input("21) DSM", value="N/A", key=f"dsm_{idx}")
+                nt_mar      = st.text_input("22) NOTA DE TRANSF. MAR", value="N/A", key=f"ntm_{idx}")
+                protocolo   = st.text_input("23) PROTOCOLO", value="N/A", key=f"prot_{idx}")
+
+                # Monta a máscara (com aspas onde solicitado)
+                mask_text = (
+f'1- "{texto_breve}"\n'
+f'2-DOCUMENTO DE CHEGADA: {doc_chegada}\n'
+f'3-MATERIAL:   "{texto_breve}"\n'
+f'4-NOTA PETROBRAS: {nota_petro}\n'
+f'5-NOTA DE SAÍDA BASE: {nota_base}\n'
+f'6-NOTA DE SAÍDA PETROBRAS: {nota_pet_sa}\n'
+f'7-N° DE CSP: {csp}\n'
+f'8-PROJETO: {projeto}\n'
+f'9-RT: {rt}\n'
+f'10-MATERIAL INVENTARIADO: {invent}\n'
+f'11-FERRAMENTA: {ferram}\n'
+f'12-TAG BCDS DA FERRAMENTA: {tag_bcds}\n'
+f'13-NM:  "{nm_val}"\n'
+f'14-CENTRO:  "{centro_val}"\n'
+f'15-DESENHO:  "{desenho}"\n'
+f'16-IMOBILIZADO: {imob}\n'
+f'17-QUANTIDADE:  "{qtdnf}""{unnf}"\n'
+f'18-N° DE CAIXA: {caixa}\n'
+f'19-DIAGRAMA DE REDE / ELEMENTO PEP:"{pep_val}"\n'
+f'20-PTM: {ptm}\n'
+f'21-DSM: {dsm}\n'
+f'22-NOTA DE TRANSF. MAR: {nt_mar}\n'
+f'23-PROTOCOLO: {protocolo}'
+                )
+
+                # Área editável e botões de copiar/baixar
+                st.text_area("📋 Máscara gerada (editável)", value=mask_text, height=300, key=f"mask_area_{idx}")
+
+                # Botão de copiar (JS simples) + fallback de download
+                html_copy = f"""
+<div>
+  <button onclick="navigator.clipboard.writeText(document.getElementById('mask_txt_{idx}').value)"
+          style="margin-right:8px;">📋 Copiar máscara #{idx+1}</button>
+  <textarea id="mask_txt_{idx}" style="position:absolute; left:-10000px;">{mask_text}</textarea>
+</div>
+"""
+                st.markdown(html_copy, unsafe_allow_html=True)
+
+                buf_item = io.BytesIO(mask_text.encode("utf-8"))
+                st.download_button(
+                    label=f"⬇️ Baixar máscara #{idx+1} (.txt)",
+                    data=buf_item,
+                    file_name=f"mascara_item_{idx+1}.txt",
+                    mime="text/plain"
+                )
 
     with tab_nf_only:
         df_l = df_merge[df_merge['_merge'] == 'left_only'].drop(columns=['_merge'])
